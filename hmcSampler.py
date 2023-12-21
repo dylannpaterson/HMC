@@ -5,9 +5,10 @@ class HMCSampler:
 
         self.t0 = 0.0
         self.tf = 1.0
-        self.e = 0.03
+        self.e = 0.003
         self.n = 10000
         self.m = 1.0
+        self.warn = ''
 
     def leapfrog (self,qi,pi,U,dU):
 
@@ -46,8 +47,12 @@ class HMCSampler:
             Kf = sum(pf**2)/2.0
 
             deltaE = np.exp(Ui-Uf+Ki-Kf)
+
             acceptance = np.random.rand(1)
 
             q_sample[:,ii] = qf*(acceptance < deltaE) + q*(acceptance >= deltaE)
 
             self.sample = q_sample
+
+            if len(self.warn)>0:
+                print(self.warn)
