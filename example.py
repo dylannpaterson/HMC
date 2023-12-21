@@ -10,7 +10,7 @@ def U(q):
 
 def f(q,x):
     return np.polynomial.polynomial.polyval(x,q)
-
+ 
 def df(q,x):
     indicies = np.arange(len(q))
     return np.power(np.asarray([x]*len(q)).T,indicies).T
