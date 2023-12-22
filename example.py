@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import corner
 from  hmcSampler import HMCSampler
 
 def dU(q):
@@ -22,17 +23,21 @@ def main():
 
     x = np.linspace(-5.0,5.0,100)
     p = np.asarray([2.0,5.0,-1.0,1.0])
-    y = f(p,x) + np.random.randn(len(x))
-
-
+    y = f(p,x) + 5.0*np.random.randn(len(x))
 
     smp = HMCSampler()
+    smp.m = 1.0
     smp.tf = 0.1
+    smp.n = 10000
     smp.qi = np.asarray([1.5,1.0,0.0,0.0])
+
+    y0 = f(smp.qi,x)
+    
     smp.HMC(U,dU)
 
     py = f((np.median(smp.sample,axis=1)),x)
     plt.plot(x,y,'.')
+    plt.plot(x,y0,'b--')
     plt.plot(x,py,'r-')
     plt.show()
 

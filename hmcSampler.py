@@ -5,7 +5,7 @@ class HMCSampler:
 
         self.t0 = 0.0
         self.tf = 1.0
-        self.e = 0.003
+        self.e = 0.002
         self.n = 10000
         self.m = 1.0
         self.warn = ''
