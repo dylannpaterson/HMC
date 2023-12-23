@@ -22,9 +22,9 @@ def main():
     global x
     global dx
 
-    x = np.linspace(-2.0,2.0,100)
+    x = np.linspace(-5.0,5.0,100)
     p = np.asarray([2.0,5.0,1.0,1.0])
-    y = f(p,x) + 0.5*np.random.randn(len(x))
+    y = f(p,x) + np.random.randn(len(x))
 
     indicies = np.arange(len(p))
     xp = (x*np.ones((len(p),len(x)))).T
@@ -32,6 +32,10 @@ def main():
 
     smp = HMCSampler()
     smp.qi = np.asarray([1.5,4.0,0.0,0.0])
+    smp.n_samples = 2000
+    smp.n_burnin = 1000
+    smp.steps = 50
+    smp.epsilon = 0.001
 
     y0 = f(smp.qi,x)
 
