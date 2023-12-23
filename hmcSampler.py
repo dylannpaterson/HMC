@@ -4,7 +4,7 @@ class HMCSampler:
     def __init__(self):
 
         self.t0 = 0.0
-        self.tf = 1.0
+        self.tf = 0.05
         self.e = 0.002
         self.m = 1.0
 
@@ -12,7 +12,7 @@ class HMCSampler:
         
         self.warn = ''
 
-        self.n_samples = 10000
+        self.n_samples = 1000
         self.n_burnin = 1000
         
 
@@ -39,9 +39,9 @@ class HMCSampler:
         q_sample = np.zeros((len(self.qi),self.n,self.n_walkers))
         q_sample[:,0,:] = (self.qi + self.qi*np.random.randn(self.n_walkers,len(self.qi))).T
 
-        for ii in range(1,self.n):
+        for ii in range(1,int(self.n/2)):
 
-            q = q_sample[:,ii-1,:]
+            q = q_sample[:,2*ii-1,:]
             p = np.random.randn(len(self.qi),self.n_walkers)
             t,qf,pf = self.leapfrog(q,p,U,dU)
 
@@ -56,13 +56,24 @@ class HMCSampler:
             Uf = U(qf)
             Kf = np.sum(pf**2,axis=0)/2.0
 
-
-
             deltaE = np.exp(Ui-Uf+Ki-Kf)
 
             acceptance = np.random.rand(self.n_walkers)
 
-            q_sample[:,ii,:] = (qf*(acceptance < deltaE) + q*(acceptance >= deltaE))
+            q_sample[:,2*ii,:] = (qf*(acceptance < deltaE) + q*(acceptance >= deltaE))
+
+            q_i = q_sample[:,2*ii,:]
+
+            q_f = (q_i + 0.1*q_i*np.random.randn(len(self.qi),self.n_walkers))
+
+            U_f = U(q_f)
+
+            deltaU = np.exp(Uf - U_f)
+
+            acceptance = np.random.rand(self.n_walkers)
+
+            q_sample[:,2*ii+1,:] = (q_f*(acceptance < deltaU) + qf*(acceptance >= deltaU))
+
 
             
 

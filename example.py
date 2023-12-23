@@ -23,23 +23,15 @@ def main():
     global dx
 
     x = np.linspace(-2.0,2.0,100)
-    p = np.asarray([2.0,5.0,1.0])
-    y = f(p,x) + np.random.randn(len(x))
-
+    p = np.asarray([2.0,5.0,1.0,1.0])
+    y = f(p,x) + 0.5*np.random.randn(len(x))
 
     indicies = np.arange(len(p))
     xp = (x*np.ones((len(p),len(x)))).T
     dx = np.power(xp,indicies).T
 
-
-
     smp = HMCSampler()
-    smp.m = 1.0
-    smp.tf = 0.05
-    smp.n_burnin = 500
-    smp.n_samples = 1000
-    smp.n_walkers = 30
-    smp.qi = np.asarray([1.5,4.0,0.0])
+    smp.qi = np.asarray([1.5,4.0,0.0,0.0])
 
     y0 = f(smp.qi,x)
 
@@ -53,8 +45,6 @@ def main():
     plt.plot(x,py,'r-')
     plt.show()
 
-    print(np.median(smp.samples,axis=0))
-
     figure = corner.corner(
     smp.samples,
     labels=[
@@ -67,8 +57,6 @@ def main():
     title_kwargs={"fontsize": 12})
 
     plt.show()
-
-
 
 if __name__ == "__main__":
     main()
