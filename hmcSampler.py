@@ -18,7 +18,7 @@ class HMCSampler:
         self.warn = ''
         
 
-    def leapfrog (self,qi,pi,U,dU):
+    def leapfrog (self,qi,pi):
 
         t = np.arange(self.t0,self.t0+self.epsilon*self.steps,self.epsilon)
         q = np.zeros((len(self.qi),len(t),self.n_walkers))
@@ -28,13 +28,13 @@ class HMCSampler:
         p[:,0,:] = pi
 
         for i,ti in enumerate(t[:-1],start=1):
-            ph = p[:,i-1,:] - (self.epsilon/2.0)*dU(q[:,i-1,:])
+            ph = p[:,i-1,:] - (self.epsilon/2.0)*self.dU(q[:,i-1,:])
             q[:,i,:] = q[:,i-1,:] + (self.epsilon)*ph/self.m
-            p[:,i,:] = ph - (self.epsilon/2.0)*dU(q[:,i,:])
+            p[:,i,:] = ph - (self.epsilon/2.0)*self.dU(q[:,i,:])
 
         return t,q,p
     
-    def HMC(self,U,dU):
+    def runHMC(self):
 
         self.n = self.n_samples + self.n_burnin
 
@@ -45,15 +45,15 @@ class HMCSampler:
 
             q = q_sample[:,2*ii-1,:]
             p = self.p0*np.random.randn(len(self.qi),self.n_walkers)
-            t,qf,pf = self.leapfrog(q,p,U,dU)
+            t,qf,pf = self.leapfrog(q,p)
 
             qf = qf[:,-1,:]
             pf = -pf[:,-1,:]
 
-            Ui  = U(q)
+            Ui  = self.U(q)
             Ki = np.sum(p**2,axis=0)/2.0
 
-            Uf_hmc = U(qf)
+            Uf_hmc = self.U(qf)
             Kf_hmc = np.sum(pf**2,axis=0)/2.0
 
             deltaE = np.exp(Ui-Uf_hmc+Ki-Kf_hmc)
@@ -70,7 +70,7 @@ class HMCSampler:
 
             qf_mcmc = (qi_mcmc + median_delta_q*np.random.randn(len(self.qi),self.n_walkers))
 
-            Uf_mcmc = U(qf_mcmc)
+            Uf_mcmc = self.U(qf_mcmc)
 
             deltaU = np.exp(Uf_hmc - Uf_mcmc)
 
