@@ -40,12 +40,15 @@ class HMCSampler:
 
         q_sample = np.zeros((len(self.qi),self.n,self.n_walkers))
         q_sample[:,0,:] = (self.qi + self.qi*np.random.randn(self.n_walkers,len(self.qi))).T
+        q_orbit = np.zeros((len(self.qi),self.steps,self.n,self.n_walkers))
 
         for ii in range(1,int(self.n/2)):
 
             q = q_sample[:,2*ii-1,:]
             p = self.p0*np.random.randn(len(self.qi),self.n_walkers)
             t,qf,pf = self.leapfrog(q,p)
+
+            q_orbit[:,:,2*ii-1,:] = qf
 
             qf = qf[:,-1,:]
             pf = -pf[:,-1,:]
@@ -84,3 +87,4 @@ class HMCSampler:
                 print(self.warn)
 
         self.samples = q_sample[:,self.n_burnin:,:].T
+        self.orbits = q_orbit[:,:,self.n_burnin:,:].T
