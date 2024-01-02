@@ -1,11 +1,15 @@
 import numpy as np
+import matplotlib.pyplot as plt
+import corner
+from scipy.integrate import simpson
+from matplotlib.ticker import FormatStrFormatter
 
 class HMCSampler:
     def __init__(self):
 
         self.t0 = 0.0
-        self.steps = 50
-        self.epsilon = 0.02
+        self.steps = 20
+        self.lf_length = 1.0
         self.m = 1.0
 
         self.p0 = 1.0
@@ -37,18 +41,22 @@ class HMCSampler:
     def runHMC(self):
 
         self.n = self.n_samples + self.n_burnin
+        self.n_parameters = len(self.qi)
+
+        self.epsilon = self.lf_length/self.steps
 
         q_sample = np.zeros((len(self.qi),self.n,self.n_walkers))
         q_sample[:,0,:] = (self.qi + self.qi*np.random.randn(self.n_walkers,len(self.qi))).T
         q_orbit = np.zeros((len(self.qi),self.steps,self.n,self.n_walkers))
 
-        for ii in range(1,int(self.n/2)):
 
-            q = q_sample[:,2*ii-1,:]
+        for ii in range(1,int(self.n)):
+
+            q = q_sample[:,ii-1,:]
             p = self.p0*np.random.randn(len(self.qi),self.n_walkers)
             t,qf,pf = self.leapfrog(q,p)
 
-            q_orbit[:,:,2*ii-1,:] = qf
+            q_orbit[:,:,ii-1,:] = qf
 
             qf = qf[:,-1,:]
             pf = -pf[:,-1,:]
@@ -65,26 +73,100 @@ class HMCSampler:
 
             self.hmc_acceptance = acceptance < deltaE
 
-            q_sample[:,2*ii,:] = (qf*(acceptance < deltaE) + q*(acceptance >= deltaE))
-
-            qi_mcmc = q_sample[:,2*ii,:]
-
-            median_delta_q = np.median(qf - q,axis=0)
-
-            qf_mcmc = (qi_mcmc + median_delta_q*np.random.randn(len(self.qi),self.n_walkers))
-
-            Uf_mcmc = self.U(qf_mcmc)
-
-            deltaU = np.exp(Uf_hmc - Uf_mcmc)
-
-            acceptance = np.random.rand(self.n_walkers)
-
-            self.mcmc_acceptance = acceptance < deltaU
-
-            q_sample[:,2*ii+1,:] = (qf_mcmc*(acceptance < deltaU) + qf*(acceptance >= deltaU))
+            q_sample[:,ii,:] = (qf*(acceptance < deltaE) + q*(acceptance >= deltaE))
 
             if len(self.warn)>0:
                 print(self.warn)
 
-        self.samples = q_sample[:,self.n_burnin:,:].T
-        self.orbits = q_orbit[:,:,self.n_burnin:,:].T
+        self.samples = np.reshape(q_sample[:,self.n_burnin:,:].T,(self.n_samples*self.n_walkers,len(self.qi)))
+
+        self.orbits = np.reshape(q_orbit[:,:,self.n_burnin:,:].T,(self.n_samples*self.n_walkers,self.steps,len(self.qi)))
+
+    def plotSamples(self, labels):
+        figure = corner.corner(
+            self.samples,
+            labels=labels,
+                quantiles=[0.16, 0.5, 0.84],
+                show_titles=True,
+                title_kwargs={"fontsize": 12})
+        plt.show()
+
+    def plotOrbits(self, n_orbits):
+
+        fig,ax = plt.subplots(self.n_parameters, self.n_parameters, sharex= 'col', 
+                              figsize=(3.0*self.n_parameters,3.0*self.n_parameters))
+
+        n = 30
+
+        ps = []
+        for i in range(self.n_parameters):
+            ps.append(np.linspace(np.min(self.samples[:,i]),np.max(self.samples[:,i]),n))
+
+
+        pp = np.asarray(np.meshgrid(*ps, indexing='ij'))
+
+        uu = np.exp(-self.U(pp.reshape((self.n_parameters,n**self.n_parameters)))).reshape([n]*self.n_parameters)
+
+        for i in range(self.n_parameters):
+            for j in range(self.n_parameters):
+
+                if i == j:
+
+                    axes = {i,j}
+
+                    other_axes = list(set(range(self.n_parameters)) - axes)
+                    other_axes.reverse()
+
+                    cntr = uu
+                    px = pp*1.0
+                    ppx = pp[i]
+                    ppy = pp[j]
+
+
+                    for k in other_axes:
+                        cntr = simpson(cntr,px[k,...],axis=k)
+                        cntr = cntr/np.sum(cntr)
+                        px = np.min(px,axis=k+1)
+
+                        ppx = np.min(ppx,axis=k)
+                        ppy = np.min(ppy,axis=k)
+
+                    ax[j,i].plot(ppx,cntr, 'k-')
+                    ax[j,i].set_xticks(np.linspace(np.min(ppx),np.max(ppx),5))
+                    ax[j,i].xaxis.set_major_formatter(FormatStrFormatter('%.2f'))
+                    ax[j,i].set_yticklabels ([])
+
+
+                elif i<j:
+
+                    axes = {i,j}
+
+                    other_axes = list(set(range(self.n_parameters)) - axes)
+                    other_axes.reverse()
+
+                    cntr = uu
+                    px = pp
+                    ppx = pp[i]
+                    ppy = pp[j]
+
+
+                    for k in other_axes:
+                        cntr = simpson(cntr,px[k,...],axis=k)
+                        px = np.min(px,axis=k+1)
+
+                        ppx = np.min(ppx,axis=k)
+                        ppy = np.min(ppy,axis=k)
+
+                    ax[j,i].contourf(ppx,ppy,cntr, levels = 10, norm='linear', cmap = 'Blues', alpha=0.5)
+                    ax[j,i].set_xticks(np.linspace(np.min(ppx),np.max(ppx),5))
+                    ax[j,i].set_yticks(np.linspace(np.min(ppy),np.max(ppy),5))
+                    ax[j,i].yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
+                    ax[j,i].plot(self.orbits[:n_orbits,:,i].T,self.orbits[:n_orbits,:,j].T,'k-')
+
+                    if i>0:
+                        ax[j,i].set_yticklabels ([])
+
+                else:
+                    ax[j,i].axis('off')
+
+        plt.show()
