@@ -2,6 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import corner
 from scipy.integrate import simpson
+from scipy.ndimage import gaussian_filter
 from matplotlib.ticker import FormatStrFormatter
 
 class HMCSampler:
@@ -91,50 +92,50 @@ class HMCSampler:
                 title_kwargs={"fontsize": 12})
         plt.show()
 
-    def plotOrbits(self, n_orbits):
+    def plotOrbits(self, n_orbits, labels):
 
         fig,ax = plt.subplots(self.n_parameters, self.n_parameters, sharex= 'col', 
                               figsize=(3.0*self.n_parameters,3.0*self.n_parameters))
 
-        n = 30
-
-        ps = []
-        for i in range(self.n_parameters):
-            ps.append(np.linspace(np.min(self.samples[:,i]),np.max(self.samples[:,i]),n))
-
-
-        pp = np.asarray(np.meshgrid(*ps, indexing='ij'))
-
-        uu = np.exp(-self.U(pp.reshape((self.n_parameters,n**self.n_parameters)))).reshape([n]*self.n_parameters)
 
         for i in range(self.n_parameters):
             for j in range(self.n_parameters):
 
                 if i == j:
 
-                    axes = {i,j}
+                    hist, xedges = np.histogram(self.samples[:,i],50)
 
-                    other_axes = list(set(range(self.n_parameters)) - axes)
-                    other_axes.reverse()
-
-                    cntr = uu
-                    px = pp*1.0
-                    ppx = pp[i]
-                    ppy = pp[j]
+                    xcentres = (xedges[1:] + xedges[:-1])/2.0
 
 
-                    for k in other_axes:
-                        #cntr = simpson(cntr,px[k,...],axis=k)
-                        cntr = cntr/np.sum(cntr)
-                        px = np.min(px,axis=k+1)
-
-                        ppx = np.min(ppx,axis=k)
-                        ppy = np.min(ppy,axis=k)
-
-                    #ax[j,i].plot(ppx,cntr, 'k-')
-                    ax[j,i].set_xticks(np.linspace(np.min(ppx),np.max(ppx),5))
+                    ax[j,i].hist(self.samples[:,i], 30, histtype ='step', color='k')
+                    ax[j,i].set_xticks(np.linspace(np.min(xcentres),np.max(xcentres),5))
                     ax[j,i].xaxis.set_major_formatter(FormatStrFormatter('%.2f'))
                     ax[j,i].set_yticklabels ([])
+
+                    low,med,hi = np.quantile(self.samples[:,i],(0.16,0.5,0.84))
+
+                    low = low - med
+                    hi = hi - med
+
+                    ax[j,i].set_title(labels[i] + '={:.2f}'.format(med) + '$_{{{0:.2f}}}^{{+{1:.2f}}}$'.format(low,hi))
+
+                    lowy,hiy = ax[j,i].get_ylim()
+
+                    ax[j,i].plot([med,med],[1e-24,1e24],'k--')
+                    ax[j,i].plot([med+low,med+low],[1e-24,1e24],'k:')
+                    ax[j,i].plot([med+hi,med+hi],[1e-24,1e24],'k:')
+
+                    lowx, hix = np.quantile(self.samples[:,i],(0.001,0.999))
+
+                    ax[j,i].set_xlim((lowx,hix))
+                    ax[j,i].set_ylim((lowy,hiy))
+
+                    if j == self.n_parameters-1:
+                        ax[j,i].set_xlabel(labels[i])
+
+                    if i == 0:
+                        ax[j,i].set_ylabel(labels[j])
 
 
                 elif i<j:
@@ -144,29 +145,46 @@ class HMCSampler:
                     other_axes = list(set(range(self.n_parameters)) - axes)
                     other_axes.reverse()
 
-                    cntr = uu
-                    px = pp
-                    ppx = pp[i]
-                    ppy = pp[j]
 
+                    hist, xedges,yedges = np.histogram2d(self.samples[:,i],self.samples[:,j],(50,50))
 
-                    for k in other_axes:
-                        #cntr = simpson(cntr,px[k,...],axis=k)
-                        px = np.min(px,axis=k+1)
+                    xcentres = (xedges[1:] + xedges[:-1])/2.0
+                    ycentres = (yedges[1:] + yedges[:-1])/2.0
 
-                        ppx = np.min(ppx,axis=k)
-                        ppy = np.min(ppy,axis=k)
+                    hist = gaussian_filter(hist,1.0).T
 
-                    #ax[j,i].contourf(ppx,ppy,cntr, levels = 10, norm='linear', cmap = 'Blues', alpha=0.5)
-                    ax[j,i].set_xticks(np.linspace(np.min(ppx),np.max(ppx),5))
-                    ax[j,i].set_yticks(np.linspace(np.min(ppy),np.max(ppy),5))
+                    medx = np.quantile(self.samples[:,i],0.5)
+                    medy = np.quantile(self.samples[:,j],0.5)
+
+                    lowx, hix = np.quantile(self.samples[:,i],(0.001,0.999))
+                    lowy, hiy = np.quantile(self.samples[:,j],(0.001,0.999))
+
+                    ax[j,i].contourf(xcentres,ycentres,hist, levels = 10, norm='linear', cmap = 'Greys', alpha=0.7)
+
+                    ax[j,i].plot(xcentres,medy*(xcentres*0.0 + 1.0),'k--', alpha = 0.5)
+                    ax[j,i].plot(medx*(xcentres*0.0 + 1.0),ycentres,'k--', alpha = 0.5)
+
+                    ax[j,i].plot(self.orbits[:n_orbits,:,i].T,self.orbits[:n_orbits,:,j].T,'b-', alpha = 0.7)
+                    ax[j,i].plot(self.samples[:n_orbits,i],self.samples[:n_orbits,j],'bo', alpha = 0.7)
+
+                    ax[j,i].set_xlim((lowx,hix))
+                    ax[j,i].set_ylim((lowy,hiy))
+                    ax[j,i].set_xticks(np.linspace(lowx,hix,5))
+                    ax[j,i].set_yticks(np.linspace(lowy,hiy,5))
                     ax[j,i].yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
-                    ax[j,i].plot(self.orbits[:n_orbits,:,i].T,self.orbits[:n_orbits,:,j].T,'k-', alpha = 0.7)
+
+                    if j == self.n_parameters-1:
+                        ax[j,i].set_xlabel(labels[i])
+
+                    if i == 0:
+                        ax[j,i].set_ylabel(labels[j])
 
                     if i>0:
                         ax[j,i].set_yticklabels ([])
 
+
                 else:
                     ax[j,i].axis('off')
 
+        plt.tight_layout(pad=0.4, w_pad=0.1, h_pad=0.1)
         plt.show()
