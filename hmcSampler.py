@@ -124,14 +124,14 @@ class HMCSampler:
 
 
                     for k in other_axes:
-                        cntr = simpson(cntr,px[k,...],axis=k)
+                        #cntr = simpson(cntr,px[k,...],axis=k)
                         cntr = cntr/np.sum(cntr)
                         px = np.min(px,axis=k+1)
 
                         ppx = np.min(ppx,axis=k)
                         ppy = np.min(ppy,axis=k)
 
-                    ax[j,i].plot(ppx,cntr, 'k-')
+                    #ax[j,i].plot(ppx,cntr, 'k-')
                     ax[j,i].set_xticks(np.linspace(np.min(ppx),np.max(ppx),5))
                     ax[j,i].xaxis.set_major_formatter(FormatStrFormatter('%.2f'))
                     ax[j,i].set_yticklabels ([])
@@ -151,17 +151,17 @@ class HMCSampler:
 
 
                     for k in other_axes:
-                        cntr = simpson(cntr,px[k,...],axis=k)
+                        #cntr = simpson(cntr,px[k,...],axis=k)
                         px = np.min(px,axis=k+1)
 
                         ppx = np.min(ppx,axis=k)
                         ppy = np.min(ppy,axis=k)
 
-                    ax[j,i].contourf(ppx,ppy,cntr, levels = 10, norm='linear', cmap = 'Blues', alpha=0.5)
+                    #ax[j,i].contourf(ppx,ppy,cntr, levels = 10, norm='linear', cmap = 'Blues', alpha=0.5)
                     ax[j,i].set_xticks(np.linspace(np.min(ppx),np.max(ppx),5))
                     ax[j,i].set_yticks(np.linspace(np.min(ppy),np.max(ppy),5))
                     ax[j,i].yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
-                    ax[j,i].plot(self.orbits[:n_orbits,:,i].T,self.orbits[:n_orbits,:,j].T,'k-')
+                    ax[j,i].plot(self.orbits[:n_orbits,:,i].T,self.orbits[:n_orbits,:,j].T,'k-', alpha = 0.7)
 
                     if i>0:
                         ax[j,i].set_yticklabels ([])
