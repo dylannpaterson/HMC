@@ -95,7 +95,7 @@ class HMCSampler:
     def plotOrbits(self, n_orbits, labels):
 
         fig,ax = plt.subplots(self.n_parameters, self.n_parameters, sharex= 'col', 
-                              figsize=(3.0*self.n_parameters,3.0*self.n_parameters))
+                              figsize=(2.5*self.n_parameters,2.5*self.n_parameters))
 
 
         for i in range(self.n_parameters):
