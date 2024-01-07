@@ -86,18 +86,34 @@ class HMCSampler:
 
         self.Uf = self.U(self.samples.T).T
 
-    def plotSamples(self, labels):
+    def plotSamples(self, labels: list):
+        """Produces corner plot of samples
+
+        Args:
+            labels (list): names of parameters to be added to plots
+
+        Returns:
+            matplotlib.figure.Figure: corner plot of samples
+        """
         figure = corner.corner(
             self.samples,
             labels=labels,
                 quantiles=[0.16, 0.5, 0.84],
                 show_titles=True,
                 title_kwargs={"fontsize": 12})
-        plt.show()
+        return figure
 
-    def plotOrbits(self, n_orbits, labels):
+    def plotOrbits(self, n_orbits: int, labels: list):
+        """Produces corner plot with first n_orbits orbits overplotted
 
-        fig,ax = plt.subplots(self.n_parameters, self.n_parameters, sharex= 'col', 
+        Args:
+            n_orbits (int): number of orbits to be displayed on corner plot
+            labels (list): names of parameters to be added to plots
+        Returns:
+            matplotlib.figure.Figure: corner plot of samples with obrits overplotted
+        """        ''''''
+
+        figure,ax = plt.subplots(self.n_parameters, self.n_parameters, sharex= 'col', 
                               figsize=(2.5*self.n_parameters,2.5*self.n_parameters))
 
 
@@ -195,4 +211,4 @@ class HMCSampler:
                     ax[j,i].axis('off')
 
         plt.tight_layout(pad=0.4, w_pad=0.1, h_pad=0.1)
-        plt.show()
+        return figure
