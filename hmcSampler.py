@@ -40,7 +40,7 @@ class HMCSampler:
 
         return t,q,p
     
-    def runHMC(self):
+    def run_hmc(self):
 
         self.n = self.n_samples + self.n_burnin
         self.n_parameters = len(self.qi)
@@ -86,7 +86,7 @@ class HMCSampler:
 
         self.Uf = self.U(self.samples.T).T
 
-    def plotSamples(self, labels: list):
+    def plot_samples(self, labels: list):
         """Produces corner plot of samples
 
         Args:
@@ -103,7 +103,7 @@ class HMCSampler:
                 title_kwargs={"fontsize": 12})
         return figure
 
-    def plotOrbits(self, n_orbits: int, labels: list):
+    def plot_orbits(self, n_orbits: int, labels: list):
         """Produces corner plot with first n_orbits orbits overplotted
 
         Args:
