@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import corner
 from scipy.integrate import simpson
 from scipy.ndimage import gaussian_filter
+from scipy.stats import gaussian_kde
 from matplotlib.ticker import FormatStrFormatter
 
 class HMCSampler:
@@ -83,6 +84,8 @@ class HMCSampler:
 
         self.orbits = np.reshape(q_orbit[:,:,self.n_burnin:,:].T,(self.n_samples*self.n_walkers,self.steps,len(self.qi)))
 
+        self.Uf = self.U(self.samples.T).T
+
     def plotSamples(self, labels):
         figure = corner.corner(
             self.samples,
@@ -103,7 +106,7 @@ class HMCSampler:
 
                 if i == j:
 
-                    hist, xedges = np.histogram(self.samples[:,i],50)
+                    hist, xedges = np.histogram(self.samples[:,i],51)
 
                     xcentres = (xedges[1:] + xedges[:-1])/2.0
 
@@ -145,13 +148,15 @@ class HMCSampler:
                     other_axes = list(set(range(self.n_parameters)) - axes)
                     other_axes.reverse()
 
+                    xcentres = np.linspace(np.min(self.samples[:,i]),np.max(self.samples[:,i]),51)
+                    ycentres = np.linspace(np.min(self.samples[:,j]),np.max(self.samples[:,j]),51)
 
-                    hist, xedges,yedges = np.histogram2d(self.samples[:,i],self.samples[:,j],(50,50))
+                    xx,yy = np.meshgrid(xcentres,ycentres)
 
-                    xcentres = (xedges[1:] + xedges[:-1])/2.0
-                    ycentres = (yedges[1:] + yedges[:-1])/2.0
+                    kern = gaussian_kde(np.vstack([self.samples[:,i],self.samples[:,j]]))
 
-                    hist = gaussian_filter(hist,1.0).T
+                    hist = np.reshape(kern(np.vstack([xx.ravel(),yy.ravel()])).T, xx.shape)
+                    hist = hist/np.max(hist)
 
                     medx = np.quantile(self.samples[:,i],0.5)
                     medy = np.quantile(self.samples[:,j],0.5)
@@ -159,19 +164,22 @@ class HMCSampler:
                     lowx, hix = np.quantile(self.samples[:,i],(0.001,0.999))
                     lowy, hiy = np.quantile(self.samples[:,j],(0.001,0.999))
 
-                    ax[j,i].contourf(xcentres,ycentres,hist, levels = 10, norm='linear', cmap = 'Greys', alpha=0.7)
+                    lvls = [0.118, 0.393, 0.675,0.864,1.0]
+
+                    ax[j,i].contourf(xcentres,ycentres,hist, levels = lvls, norm='linear', cmap = 'Greys', alpha=0.7)
 
                     ax[j,i].plot(xcentres,medy*(xcentres*0.0 + 1.0),'k--', alpha = 0.5)
                     ax[j,i].plot(medx*(xcentres*0.0 + 1.0),ycentres,'k--', alpha = 0.5)
 
                     ax[j,i].plot(self.orbits[:n_orbits,:,i].T,self.orbits[:n_orbits,:,j].T,'b-', alpha = 0.7)
-                    ax[j,i].plot(self.samples[:n_orbits,i],self.samples[:n_orbits,j],'bo', alpha = 0.7)
+                    ax[j,i].plot(self.samples[:n_orbits+1,i],self.samples[:n_orbits+1,j],'bo', alpha = 0.7)
 
                     ax[j,i].set_xlim((lowx,hix))
                     ax[j,i].set_ylim((lowy,hiy))
                     ax[j,i].set_xticks(np.linspace(lowx,hix,5))
                     ax[j,i].set_yticks(np.linspace(lowy,hiy,5))
                     ax[j,i].yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
+
 
                     if j == self.n_parameters-1:
                         ax[j,i].set_xlabel(labels[i])
