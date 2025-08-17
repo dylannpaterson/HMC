@@ -1,195 +1,154 @@
-import numpy as np
+import os
+# This flag must be set before jax is imported.
+# Set this to the number of CPU cores you want JAX to see.
+# If you have a GPU, JAX will use it by default and this flag will be ignored.
+os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=8'
+
+import jax
+import jax.numpy as jnp
+from jax import random
+import numpy as np # Retain numpy for plotting and scipy compatibility
 import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
 import corner
-from scipy.integrate import simpson
-from scipy.ndimage import gaussian_filter
 from scipy.stats import gaussian_kde
 from matplotlib.ticker import FormatStrFormatter
 from tqdm import tqdm
 import pickle
 from datetime import datetime
+import time
+import functools
 
 
 class HMCSampler:
-    def __init__(self):
+    """
+    Hamiltonian Monte Carlo (HMC) sampler refactored to use JAX.
 
-        self.t0 = 0.0
-        self.steps = 20
+    This sampler leverages JAX for automatic differentiation to compute gradients
+    of the potential energy function `U` by default. It can also accept a
+    manually provided gradient function `dU`.
+
+    The core sampling step is parallelized across available devices using `jax.pmap`.
+    """
+
+    def __init__(self, U, dU=None):
+        """
+        Initializes the HMC sampler.
+
+        The core logic for selecting the gradient function resides here.
+
+        Parameters:
+            U (callable): The potential energy function (negative log probability).
+                          This function must be JAX-compatible and operate on a
+                          single position vector of shape (n_parameters,).
+            dU (callable, optional): The gradient of the potential energy. Must also
+                                     operate on a single position vector. If None,
+                                     `jax.grad(U)` is used by default.
+        """
+        # --- Core Sampler Attributes ---
+        self.qi = None # The initial center point for the walkers
+        self.steps = 64
         self.lf_length = 1.0
         self.m = 1.0
-
         self.p0 = 1.0
-
-        self.n_walkers=20
-
+        self.n_walkers = 64
         self.n_samples = 2000
         self.n_burnin = 1000
+        self.dim_labels = None # For plotting
+        self.store_orbits = False # Set to True to enable orbit plotting
 
-        self.state= None
-        self.chains= None
+        # --- State and Results ---
+        self.state = None
+        self.chains = None
         self.samples = None
         self.orbits = None
         self.acceptance = None
-
-        self.dU = self.dU_numerical
-        self.dU_step_size = 1e-9
-
         self.warn = ''
 
+        # --- File I/O ---
         self.file_name = None
         self.save_every = None
-        
 
-    def leapfrog (self,qi,pi):
-        """
-        Perform a Leapfrog integration for simulating Hamiltonian dynamics.
+        # --- THE STRATEGIC CHOICE: JAX Auto-Grad or Manual ---
+        U_single = U
+        dU_single = dU
 
-        The Leapfrog method is commonly used in Molecular Dynamics and 
-        Hamiltonian Monte Carlo simulations for solving differential equations 
-        describing particle motion. It updates position (`q`) and momentum (`p`) 
-        in an alternating manner with time (`t`).
-
-        Parameters
-        ----------
-        qi : numpy.ndarray
-            Shape (n_parameters, n_particles).
-            Initial positions of the particles. It should have dimensions 
-            corresponding to the number of particles and spatial dimensions.
-        pi : numpy.ndarray
-            Initial momenta of the particles. It should have dimensions 
-            matching those of `qi`.
-
-        Returns
-        -------
-        t : numpy.ndarray
-            Array of time steps.
-        q : numpy.ndarray
-            Array of positions at each time step for all particles.
-        p : numpy.ndarray
-            Array of momenta at each time step for all particles.
-
-        Notes
-        -----
-        - `self.dU(q)` should compute the gradient of the potential energy 
-          with respect to `q`.
-        - The timestep (`self.epsilon`) and number of steps (`self.steps`) 
-          control the resolution and duration of the simulation.
-        - Particle mass (`self.m`) affects how momentum (`p`) and position (`q`) 
-          are updated.
-        - This implementation assumes `self.n_walkers` determines the number 
-          of independent trajectories being simulated.
-
-        Example
-        -------
-        t, q, p = obj.leapfrog(initial_positions, initial_momenta)
-        """
-
-        t = np.arange(self.t0,self.t0+self.epsilon*self.steps,self.epsilon)
-        q = np.zeros((len(self.qi),len(t),self.n_walkers))
-        p = np.zeros((len(self.qi),len(t),self.n_walkers))
-
-        q[:,0,:] = qi
-        p[:,0,:] = pi
-
-        for i,ti in enumerate(t[:-1],start=1):
-
-            ph = p[:,i-1,:] - (self.epsilon/2.0)*self.dU(q[:,i-1,:])
-            q[:,i,:] = q[:,i-1,:] + (self.epsilon)*ph/self.m
-            p[:,i,:] = ph - (self.epsilon/2.0)*self.dU(q[:,i,:])
-
-
-        return t,q,p
-    
-    def initialise_walkers(self):
-        """
-        Initialize the walkers for Hamiltonian Monte-Carlo.
-
-        This function sets up the initial conditions for the walkers, including 
-        their positions (`q_sample`), orbital paths (`q_orbit`), and acceptance 
-        metrics (`q_acceptance`). Walkers are a collection of independent entities 
-        that evolve through the parameter space using Hamiltonian mechanics.
-
-        Returns
-        -------
-        q_sample : numpy.ndarray
-            Shape (n_parameters, n_collect, n_walkers). Contains the initial positions 
-            of the walkers. If `self.state` is None, positions are randomly initialized 
-            around `self.qi` with a small Gaussian perturbation. Otherwise, it uses the 
-            provided state.
-        q_orbit : numpy.ndarray
-            Shape (n_parameters, steps, n_collect, n_walkers). Pre-allocated array to 
-            store the orbital paths of the walkers over the simulation steps.
-        q_acceptance : numpy.ndarray
-            Shape (n_collect, n_walkers). Array initialized to ones, representing the 
-            acceptance metrics of walkers during the simulation.
-
-        Notes
-        -----
-        - `self.qi` represents the initial positions used for initialization.
-        - `self.n_collect` is the number of collection intervals for the simulation.
-        - `self.n_walkers` is the total number of walkers in the simulation.
-        - `self.steps` defines the number of steps in the simulation.
-        - `self.state`, if provided, is used as the initial state of the walkers.
-
-        Example
-        -------
-        q_sample, q_orbit, q_acceptance = obj.initialise_walkers()
-        """
-
-        q_sample = np.zeros((len(self.qi),self.n_collect,self.n_walkers))
-
-        if self.state is None:
-            q_sample[:,0,:] = (self.qi + 0.01*np.random.randn(self.n_walkers,len(self.qi))).T
+        if dU_single is None:
+            print("`dU` not supplied. Using `jax.grad(U)` for automatic differentiation.")
+            dU_single = jax.grad(U_single)
         else:
-            q_sample[:,0,:] = self.state
+            print("Manual `dU` supplied by the user.")
 
-        q_orbit = np.zeros((len(self.qi),self.steps,self.n_collect,self.n_walkers))
+        # Vectorize the functions to handle multiple walkers efficiently.
+        self.U = jax.vmap(U_single, in_axes=1, out_axes=0)
+        self.dU = jax.vmap(dU_single, in_axes=1, out_axes=1)
 
-        q_acceptance = np.ones((self.n_collect,self.n_walkers))
+        self.key = random.PRNGKey(42)
+
+    def _leapfrog(self, qi, pi, lf_length, steps):
+        """
+        A lean leapfrog integrator that does NOT store the orbit,
+        optimized with jax.lax.fori_loop.
+        """
+        epsilon = lf_length / steps
         
-        return q_sample, q_orbit, q_acceptance
-    
+        # Initial half-step for momentum
+        p = pi - (epsilon / 2.0) * self.dU(qi)
+        q = qi
+
+        # Main loop using JAX's optimized looping construct
+        def body_fun(i, state):
+            q, p = state
+            q_new = q + epsilon * p / self.m
+            p_new = p - epsilon * self.dU(q_new)
+            return (q_new, p_new)
+
+        # The loop runs for steps-1 full steps
+        q, p = jax.lax.fori_loop(0, steps - 1, body_fun, (q, p))
+
+        # Final full step for position and half-step for momentum
+        q = q + epsilon * p / self.m
+        p = p - (epsilon / 2.0) * self.dU(q)
+        
+        return q, -p
+
+    def _leapfrog_with_orbit(self, qi, pi, lf_length, steps):
+        """
+        Leapfrog integrator that stores the orbit, optimized with jax.lax.fori_loop.
+        """
+        epsilon = lf_length / steps
+        n_walkers_device = qi.shape[1]
+        n_parameters = qi.shape[0]
+        
+        # Initial half-step for momentum
+        p = pi - (epsilon / 2.0) * self.dU(qi)
+        q = qi
+
+        # Initialize orbit storage
+        q_orbit = jnp.zeros((steps, n_parameters, n_walkers_device))
+        q_orbit = q_orbit.at[0].set(q)
+        
+        # Main loop using JAX's optimized looping construct
+        def body_fun(i, state):
+            q, p, q_orbit = state
+            q_new = q + epsilon * p / self.m
+            p_new = p - epsilon * self.dU(q_new)
+            q_orbit = q_orbit.at[i + 1].set(q_new)
+            return (q_new, p_new, q_orbit)
+
+        # The loop runs for steps-1 full steps
+        q, p, q_orbit = jax.lax.fori_loop(0, steps - 1, body_fun, (q, p, q_orbit))
+
+        # Final full step for position and half-step for momentum
+        q = q + epsilon * p / self.m
+        p = p - (epsilon / 2.0) * self.dU(q)
+        
+        # The final position is q, not q_orbit[-1], to avoid an extra array lookup
+        return q, -p, q_orbit
+
+
     def initialise_parameters(self):
-        """
-        Initialize the parameters required for the Hamiltonian Monte-Carlo.
-
-        This function calculates and sets key attributes necessary for the 
-        execution of the simulation, such as the total number of iterations, 
-        collection intervals, number of parameters, step size, and initial 
-        state values.
-
-        Notes
-        -----
-        - If `self.state` is None, a new simulation run is initialized with a total 
-          number of iterations (`self.n`) equal to the sum of samples and burn-in steps.
-          The number of collection intervals (`self.n_collect`) is also initialized to 
-          match this total.
-        - If `self.state` is provided, the function updates the simulation parameters 
-          to collect additional samples while maintaining the existing state.
-        - The step size (`self.epsilon`) is computed based on the specified 
-          leapfrog path length (`self.lf_length`) and the number of steps (`self.steps`).
-
-        Attributes Set
-        --------------
-        self.n : int
-            Total number of iterations (samples + burn-in steps).
-        self.n_collect : int
-            Total number of collection intervals during the simulation.
-        self.n_parameters : int
-            Number of parameters (determined by the length of `self.qi`).
-        self.epsilon : float
-            Step size for the leapfrog integration, calculated as 
-            `self.lf_length / self.steps`.
-        self.initial_chains : numpy.ndarray
-            Stores the initial state of the chains for the simulation.
-        self.initial_acceptance : numpy.ndarray
-            Stores the initial acceptance rates for the walkers.
-
-        Example
-        -------
-        obj.initialise_parameters()
-        """
-
+        """Initializes parameters for the HMC run."""
         if self.state is None:
             self.n = self.n_samples + self.n_burnin
             self.n_collect = self.n
@@ -197,614 +156,594 @@ class HMCSampler:
             self.n += self.n_samples
             self.n_collect = self.n_samples + 1
 
-        self.n_parameters = len(self.qi)
-
-        self.epsilon = self.lf_length/self.steps
-
         self.initial_chains = self.chains
         self.initial_acceptance = self.acceptance
 
+    def _step(self, q, key, lf_length, steps, store_orbits):
+        """
+        Generates a new sample using one HMC step. This function is executed
+        in parallel on each device, receiving a slice of the walkers and
+        the leapfrog parameters for this specific step.
+        """
+        key, p_key, accept_key = random.split(key, 3)
         
-    def generate_sample(self,q):
-        """
-        Generate a new sample in phase space for the walkers.
+        n_walkers_device = q.shape[1]
 
-        This function performs Hamiltonian Monte Carlo (HMC) sampling for a given
-        set of initial positions (`q`). Each walker is assigned a random momentum, 
-        and the phase space is explored using the Leapfrog integration method. The 
-        function evaluates energy changes to determine whether new positions are 
-        accepted or rejected, ensuring detailed balance in the sampling process.
+        # 1. Give each walker a random momentum
+        p = self.p0 * random.normal(p_key, shape=q.shape)
 
-        Parameters
-        ----------
-        q : numpy.ndarray
-            Shape (n_parameters, n_walkers). The current positions of the walkers.
-
-        Returns
-        -------
-        qf : numpy.ndarray
-            Shape (n_parameters, n_walkers). The final positions of the walkers after 
-            the sampling step, with accepted proposals applied.
-        orbit : numpy.ndarray
-            Shape (n_parameters, n_time_steps, n_walkers). The trajectory of each walker
-            through phase space during the sampling step.
-        acceptance : numpy.ndarray
-            Shape (n_walkers,). A boolean array indicating whether the new position 
-            was accepted (`True`) or rejected (`False`) for each walker.
-
-        Notes
-        -----
-        - The momenta of the walkers are initialized with a Gaussian distribution scaled 
-          by `self.p0`.
-        - The `self.leapfrog` method is used to perform the integration of motion through 
-          phase space.
-        - The potential energy (`U`) and kinetic energy (`K`) are used to compute the 
-          Hamiltonian dynamics and energy conservation for proposal acceptance.
-        - Steps with energy changes (`deltaE`) greater than a random value are accepted; 
-          otherwise, the walker remains in its previous position.
-
-        Example
-        -------
-        qf, orbit, acceptance = obj.generate_sample(current_positions)
-        """
-
-        #give each walker a random momentum
-        p = self.p0*np.random.randn(len(self.qi),self.n_walkers)
-
-        #let each walker traverse the phase space based on initial position and momentum
-        t,qf,pf = self.leapfrog(q,p)
-
-        #save the path that each walker traversed
-        orbit = qf*1.0
-
-        #save the final momentum and position of each walker after traversing the phase space
-        qf = qf[:,-1,:]
-        pf = -pf[:,-1,:]
-
-        #determine initial potential energy and kinetic energy
-        Ui  = self.U(q)
-        Ki = np.sum(p**2,axis=0)/2.0
-
-        #determine final potential energy and kinetic energy
-        Uf_hmc = self.U(qf)
-        Kf_hmc = np.sum(pf**2,axis=0)/2.0
-
-        #determine change in energy for each walker
-
-        deltaE = np.exp(Ui-Uf_hmc+Ki-Kf_hmc)
-
-        #accept new position if change in energy is greater than some random number between 0 and 1
-        #Ideally, energy is conserved and deltaE ~ 1, so steps are nearly always accepted
-        #if not accepted, walker stays in initial position
-        acceptance = np.random.rand(self.n_walkers)
-
-        return (qf*(acceptance < deltaE) + q*(acceptance >= deltaE)), orbit, acceptance < deltaE
-
-    def save_chains(self,q_sample):
-        """
-        Save or update the Markov chains with the newly sampled positions.
-
-        This function manages the storage of sampled positions (`q_sample`) by either 
-        initializing the chains or appending new samples to the existing chains. 
-
-        Parameters
-        ----------
-        q_sample : numpy.ndarray
-            Shape (n_parameters, n_collect, n_walkers). The new sample positions 
-            generated during the simulation.
-
-        Notes
-        -----
-        - If no initial chains are present (`self.initial_chains` is None), the new 
-          sample positions are assigned directly to `self.chains`.
-        - If initial chains already exist, the function appends the new samples 
-          (excluding the first collection interval to avoid duplication) to the existing chains 
-          along the collection axis.
-
-        Attributes Modified
-        -------------------
-        self.chains : numpy.ndarray
-            The updated Markov chains containing all the sampled positions.
-
-        Example
-        -------
-        obj.save_chains(new_sample)
-        """
-        if self.initial_chains is None:
-            self.chains = q_sample
+        # 2. Traverse phase space, passing parameters explicitly
+        if store_orbits:
+            qf_prop, pf_prop, orbit = self._leapfrog_with_orbit(q, p, lf_length, steps)
         else:
-            self.chains = np.concatenate((self.initial_chains,q_sample[:,1:,:]),axis=1)
+            qf_prop, pf_prop = self._leapfrog(q, p, lf_length, steps)
+            # Create a dummy orbit if not storing to maintain function signature
+            orbit = jnp.zeros((steps, self.n_parameters, n_walkers_device))
 
-    def save_acceptance(self,q_acceptance):
-        """
-        Save or update the acceptance rates of the walkers.
 
-        This function manages the storage of acceptance data (`q_acceptance`) by either 
-        initializing the acceptance array or appending new acceptance values to the 
-        existing data. 
+        # 3. Determine initial and final energies
+        Ui = self.U(q)
+        Ki = jnp.sum(p**2, axis=0) / 2.0
+        Uf = self.U(qf_prop)
+        Kf = jnp.sum(pf_prop**2, axis=0) / 2.0
 
-        Parameters
-        ----------
-        q_acceptance : numpy.ndarray
-            Shape (n_collect, n_walkers). The new acceptance data generated during 
-            the simulation.
+        # 4. Determine change in energy
+        deltaE = jnp.exp(Ui - Uf + Ki - Kf)
 
-        Notes
-        -----
-        - If no initial acceptance data is present (`self.initial_acceptance` is None), 
-          the function initializes `self.acceptance` with the provided `q_acceptance`.
-        - If initial acceptance data exists, the function appends new acceptance values 
-          (excluding the first collection interval to avoid duplication) to the existing 
-          acceptance data along the collection axis.
+        # 5. Accept or reject the proposal
+        acceptance_rand = random.uniform(accept_key, shape=(n_walkers_device,))
+        accepted = acceptance_rand < deltaE
+        
+        qf_final = jnp.where(accepted[:, None], qf_prop.T, q.T).T
 
-        Attributes Modified
-        -------------------
-        self.acceptance : numpy.ndarray
-            The updated array containing all recorded acceptance rates.
-
-        Example
-        -------
-        obj.save_acceptance(new_acceptance)
-        """
-        if self.initial_acceptance is None:
-            self.acceptance = q_acceptance
-        else:
-            self.acceptance = np.concatenate((self.initial_acceptance,q_acceptance[1:,:]),axis=0)
-
-    def save_samples(self):
-        """
-        Extract and save the post-burn-in samples from the Markov chains.
-
-        This function processes the stored Markov chains to retrieve the samples 
-        collected after the burn-in period (`self.n_burnin`). The post-burn-in 
-        samples are reshaped for further analysis or use in statistical evaluations. 
-        If the chains contain fewer iterations than the burn-in period, no samples 
-        are saved.
-
-        Notes
-        -----
-        - The burn-in period (`self.n_burnin`) is used to discard initial samples 
-          that may not represent the equilibrium distribution.
-        - The reshaping operation converts the samples into a 2D array where each 
-          row represents a single sample, and each column represents a parameter.
-
-        Attributes Modified
-        -------------------
-        self.samples : numpy.ndarray or None
-            If valid samples exist, a 2D array of shape 
-            (n_samples_post_burnin, n_parameters) is stored. If no valid samples 
-            are available (i.e., `self.chains` contains fewer iterations than 
-            `self.n_burnin`), `self.samples` is set to `None`.
-
-        Example
-        -------
-        obj.save_samples()
-        """
-        if self.chains.shape[1] > self.n_burnin:
-            self.samples = self.chains[:,self.n_burnin:,:].T
-            self.samples = np.reshape(self.samples,(self.samples.shape[0]*self.samples.shape[1],self.n_parameters))
-        else:
-            self.samples = None
-
-    def save_orbits(self, q_orbit):
-        """
-        Save or update the orbital paths of the walkers.
-
-        This function processes and stores the orbital paths (`q_orbit`) generated 
-        during the simulation. If no orbits are currently saved (`self.orbits` is None), 
-        it initializes `self.orbits` by reshaping the input orbital data to a 3D array. 
-        If orbits already exist, the function appends the new orbital data to the 
-        existing array along the sample axis.
-
-        Parameters
-        ----------
-        q_orbit : numpy.ndarray
-            Shape (n_dimensions, steps, n_collect, n_walkers). The orbital paths of the 
-            walkers during the simulation.
-
-        Notes
-        -----
-        - The function discards the burn-in phase (`self.n_burnin`) when initializing 
-          or appending orbital paths to ensure only valid samples are stored.
-        - Orbital paths are reshaped into a 3D array with dimensions 
-          (n_samples * n_walkers, steps, n_dimensions) for efficient storage.
-        - When appending new data, the first collection interval is excluded to 
-          avoid duplication.
-
-        Attributes Modified
-        -------------------
-        self.orbits : numpy.ndarray
-            A 3D array of shape (n_total_samples * n_walkers, steps, n_dimensions) 
-            storing all recorded orbital paths.
-
-        Example
-        -------
-        obj.save_orbits(new_orbital_data)
-        """
-        if self.orbits is None:
-            self.orbits = np.reshape(q_orbit[:,:,self.n_burnin:,:].T,(self.n_samples*self.n_walkers,self.steps,len(self.qi)))
-        else:
-            self.orbits = np.concatenate((self.orbits,np.reshape(q_orbit[:,:,1:,:].T,(self.n_samples*self.n_walkers,self.steps,len(self.qi)))),axis=0)
+        return qf_final, orbit, accepted, key
 
     def run_hmc(self):
         """
-        Execute the Hamiltonian Monte Carlo (HMC) sampling process.
-
-        This function orchestrates the entire HMC workflow, from initializing 
-        parameters and walkers to performing sampling, saving intermediate results, 
-        and updating the final states. It uses a progress bar to track the sampling 
-        process and saves results at specified intervals.
-
-        Notes
-        -----
-        - The sampling process involves iteratively generating new samples, recording 
-          their orbital paths, and tracking acceptance rates for each walker.
-        - If warnings are generated during sampling (`self.warn`), they are displayed 
-          and reset.
-        - Intermediate results (chains, samples, acceptance rates) are saved at 
-          regular intervals if `self.save_every` is specified.
-
-        Workflow
-        --------
-        1. Initializes parameters and walkers.
-        2. Iteratively generates samples, orbits, and acceptance rates for the walkers.
-        4. Saves intermediate results at specified intervals.
-        5. Finalizes and saves all results at the end of the process.
-
-        Attributes Modified
-        -------------------
-        self.chains : numpy.ndarray
-            Updated Markov chains containing all collected samples.
-        self.samples : numpy.ndarray
-            Post-burn-in samples reshaped for analysis.
-        self.acceptance : numpy.ndarray
-            Updated acceptance rates for all iterations.
-        self.orbits : numpy.ndarray
-            Orbital paths of walkers collected during the simulation.
-        self.state : numpy.ndarray
-            The final state of the walkers at the end of the sampling process.
-
-        Example
-        -------
-        obj.run_hmc()
+        Executes the HMC sampling process in parallel across available devices.
         """
+        if self.qi is None:
+            raise ValueError("Attribute `self.qi` must be set before running the sampler.")
+
+        num_devices = jax.device_count()
+        if self.n_walkers % num_devices != 0:
+            raise ValueError(f"Number of walkers ({self.n_walkers}) must be divisible by "
+                             f"the number of devices ({num_devices}).")
+        
+
+        walkers_per_device = self.n_walkers // num_devices
+        print(f"Deploying {self.n_walkers} walkers across {num_devices} devices ({walkers_per_device} per device).")
+
+        self.n_parameters = self.qi.shape[0]
         self.initialise_parameters()
+        
+        # --- Create the pmapped function for this specific run ---
+        pmapped_step = jax.pmap(
+            functools.partial(self._step, lf_length=self.lf_length, steps=self.steps, store_orbits=self.store_orbits)
+        )
 
-        q_sample, q_orbit, q_acceptance = self.initialise_walkers()
+        # --- Initialize Walkers ---
+        q_sample = jnp.zeros((self.n_parameters, self.n_collect, self.n_walkers))
+        if self.state is None:
+            key, subkey = random.split(self.key)
+            initial_positions = jnp.expand_dims(self.qi, 1) + 0.01 * random.normal(subkey, shape=(self.n_parameters, self.n_walkers))
+            q_sample = q_sample.at[:, 0, :].set(initial_positions)
+        else:
+            q_sample = q_sample.at[:, 0, :].set(self.state)
 
-        #this controls the progress bar
-        with tqdm(total=self.n_collect, desc="Collecting samples") as pbar:
-            #for each sample to be collected
-            for ii in range(1,self.n_collect):
+        if self.store_orbits:
+            q_orbit = jnp.zeros((self.n_parameters, self.steps, self.n_collect, self.n_walkers))
+        
+        q_acceptance = jnp.zeros((self.n_collect, self.n_walkers))
+        
+        # Split the key for each device
+        device_keys = random.split(self.key, num_devices)
+
+        with tqdm(total=self.n_collect - 1, desc="Collecting samples") as pbar:
+            for ii in range(1, self.n_collect):
+                # Get the current positions and reshape for pmap
+                q_current_flat = q_sample[:, ii - 1, :]
+                q_current_sharded = q_current_flat.reshape(self.n_parameters, num_devices, walkers_per_device).transpose(1, 0, 2)
                 
-                q_sample[:,ii,:], q_orbit[:,:,ii-1,:],q_acceptance[ii,:]  = self.generate_sample(q_sample[:,ii-1,:])
+                # Execute one parallel step
+                q_next_sharded, orbit_sharded, accepted_sharded, device_keys = pmapped_step(
+                    q=q_current_sharded, 
+                    key=device_keys
+                )
+                
+                # Reshape results back from sharded to flat
+                q_next_flat = q_next_sharded.transpose(1, 0, 2).reshape(self.n_parameters, self.n_walkers)
+                accepted_flat = accepted_sharded.flatten()
 
-                if len(self.warn)>0:
-                    print(self.warn)
-                    self.warn = ''
+                # Update history
+                q_sample = q_sample.at[:, ii, :].set(q_next_flat)
+                q_acceptance = q_acceptance.at[ii, :].set(accepted_flat)
+                
+                if self.store_orbits:
+                    orbit_flat = orbit_sharded.transpose(2, 1, 0, 3).reshape(self.n_parameters, self.steps, self.n_walkers)
+                    q_orbit = q_orbit.at[:, :, ii - 1, :].set(orbit_flat)
 
-                if self.save_every is not None and ii>1 and ii % self.save_every==0:
-                    self.save_chains(q_sample[:,:ii,:])
+                if self.save_every is not None and ii > 1 and ii % self.save_every == 0:
+                    self.save_chains(q_sample[:, :ii, :])
                     self.save_samples()
-                    self.save_acceptance(q_acceptance[:ii,:])
-                    self.state = q_sample[:,ii,:]
+                    self.save_acceptance(q_acceptance[:ii, :])
+                    self.state = q_sample[:, ii, :]
                     self.save()
 
-
                 pbar.update(1)
+        
+        # The final key is the set of keys from all devices. We just need one for continuation.
+        self.key = device_keys[0]
 
+        # --- Finalize and Save Results ---
         self.save_chains(q_sample)
-
         self.save_samples()
-
         self.save_acceptance(q_acceptance)
+        if self.store_orbits:
+            self.save_orbits(q_orbit)
+        self.state = q_sample[:, -1, :]
+        self.calculate_medians()
+        self.calculate_covariance()
+        return True
 
-        self.save_orbits(q_orbit)
-
-        self.state = q_sample[:,-1,:]
-
-    def plot_samples(self, labels: list=None):
-        """Produces corner plot of samples
-
-        Args:
-            labels (list): names of parameters to be added to plots
-
-        Returns:
-            matplotlib.figure.Figure: corner plot of samples
+    def _integrated_autocorrelation_time(self, x):
         """
-        if labels is None:
+        Calculates the integrated autocorrelation time (IAT) of a time series.
+        This implementation is based on the method described in the `emcee` documentation.
+        """
+        # Ensure input is a numpy array
+        x = np.asarray(x)
+        # Center the data
+        x = x - np.mean(x)
+        N = len(x)
+        
+        # Compute the autocorrelation function using FFT
+        f = np.fft.fft(x, n=2*N)
+        acf = np.fft.ifft(f * np.conj(f))[:N].real
+        acf /= acf[0]
+        
+        # Automated windowing procedure to find where the ACF first becomes negative
+        try:
+            # Find the first lag where the ACF is negative
+            M = np.where(acf < 0)[0][0]
+        except IndexError:
+            # If the ACF is always positive, use a fallback window size
+            M = N // 2
+
+        # The IAT is 1 + 2 * sum(ACF from lag 1 to M)
+        tau = 1 + 2 * np.sum(acf[1:M])
+        return tau
+
+    def tune_leapfrog(self, qi_center, lf_lengths, steps_list, n_tune_samples=1000, n_tune_burnin=500):
+        """
+        Performs a grid search to find optimal leapfrog parameters.
+        
+        Parameters:
+            key (jax.random.PRNGKey): JAX random key for the tuning run.
+            qi_center (jnp.ndarray): The central point for the initial walker positions.
+            lf_lengths (list): A list of leapfrog path lengths to test.
+            steps_list (list): A list of leapfrog steps to test.
+            n_tune_samples (int): Number of samples to draw for each tuning run.
+            n_tune_burnin (int): Number of burn-in samples to discard for each tuning run.
+        
+        Returns:
+            list: A list of dictionaries, each containing the results for one parameter combination.
+        """
+        print("\n--- Commencing Leapfrog Parameter Tuning ---")
+        results = []
+        
+        self.n_parameters = qi_center.shape[0]
+
+        for lf in lf_lengths:
+            for steps in steps_list:
+                # --- Setup for this grid point ---
+                epsilon = lf / steps
+                
+                print(f"\nTuning with lf_length={lf}, steps={steps} (epsilon={epsilon:.4f})")
+                start_time = time.time()
+
+                # --- Create a pmapped function specifically for this tuning run ---
+                # Tuning runs never need to store orbits, so we set store_orbits=False
+                pmapped_step = jax.pmap(
+                    functools.partial(self._step, lf_length=lf, steps=steps, store_orbits=False)
+                )
+
+                # --- Run a self-contained HMC campaign ---
+                num_devices = jax.device_count()
+                walkers_per_device = self.n_walkers // num_devices
+                
+                self.key, init_key, run_key = random.split(self.key, 3)
+                device_keys = random.split(run_key, num_devices)
+                
+                initial_positions = jnp.expand_dims(qi_center, 1) + 0.01 * random.normal(init_key, shape=(self.n_parameters, self.n_walkers))
+
+                local_chains = jnp.zeros((self.n_parameters, n_tune_samples, self.n_walkers))
+                local_chains = local_chains.at[:, 0, :].set(initial_positions)
+                local_acceptance = jnp.zeros((n_tune_samples, self.n_walkers))
+                
+                # Main tuning loop
+                for ii in tqdm(range(1, n_tune_samples), desc="Tuning run", leave=False):
+                    q_current_flat = local_chains[:, ii - 1, :]
+                    q_current_sharded = q_current_flat.reshape(self.n_parameters, num_devices, walkers_per_device).transpose(1, 0, 2)
+                    
+                    # Pass parameters explicitly to the pmapped function
+                    q_next_sharded, _, accepted_sharded, device_keys = pmapped_step(
+                        q=q_current_sharded, 
+                        key=device_keys
+                    )
+                    
+                    q_next_flat = q_next_sharded.transpose(1, 0, 2).reshape(self.n_parameters, self.n_walkers)
+                    accepted_flat = accepted_sharded.flatten()
+
+                    local_chains = local_chains.at[:, ii, :].set(q_next_flat)
+                    local_acceptance = local_acceptance.at[ii, :].set(accepted_flat)
+                
+                runtime = time.time() - start_time
+
+                # --- Analyze results ---
+                chains_after_burn = local_chains[:, n_tune_burnin:, :]
+                acceptance_after_burn = local_acceptance[n_tune_burnin:, :]
+                
+                samples_for_iat = chains_after_burn.transpose((2, 1, 0)).reshape(-1, self.n_parameters)
+                
+                mean_acceptance = jnp.mean(acceptance_after_burn)
+                iat_per_param = [self._integrated_autocorrelation_time(samples_for_iat[:, i]) for i in range(self.n_parameters)]
+                mean_iat = np.mean(iat_per_param)
+                
+                results.append({
+                    'lf_length': lf,
+                    'steps': steps,
+                    'epsilon': epsilon,
+                    'acceptance_rate': float(mean_acceptance),
+                    'mean_iat': float(mean_iat),
+                    'runtime': runtime
+                })
+        
+        print("\n--- Leapfrog Tuning Results ---")
+        print("-" * 80)
+        print(f"{'lf_length':<12} | {'steps':<8} | {'epsilon':<10} | {'acceptance':<12} | {'mean_iat':<12} | {'runtime (s)':<12}")
+        print("-" * 80)
+        for res in results:
+            print(f"{res['lf_length']:<12.3f} | {res['steps']:<8} | {res['epsilon']:<10.4f} | {res['acceptance_rate']:<12.3f} | {res['mean_iat']:<12.2f} | {res['runtime']:<12.2f}")
+        print("-" * 80)
+
+        # Find the best parameters based on a simple heuristic:
+        # Choose the run with an acceptance rate between 0.6 and 0.8 that has the lowest IAT.
+        best_params = None
+        min_iat = float('inf')
+        for res in results:
+            if 0.6 < res['acceptance_rate'] < 0.95:
+                if res['mean_iat'] < min_iat:
+                    min_iat = res['mean_iat']
+                    best_params = res
+
+        if best_params:
+            print(f"\nOptimal parameters found: lf_length={best_params['lf_length']}, steps={best_params['steps']}")
+            self.lf_length = best_params['lf_length']
+            self.steps = best_params['steps']
+        else:
+            print("\nNo parameters found in the ideal acceptance range. Using defaults.")
+        
+        return results
+
+    # --- Utility and Plotting Functions ---
+
+    def save_chains(self, q_sample):
+        """Saves chains. Handles concatenation if continuing a run."""
+        if self.initial_chains is None:
+            self.chains = q_sample
+        else:
+            self.chains = jnp.concatenate((self.initial_chains, q_sample[:, 1:, :]), axis=1)
+
+    def save_acceptance(self, q_acceptance):
+        """Saves acceptance rates."""
+        if self.initial_acceptance is None:
+            self.acceptance = q_acceptance
+        else:
+            self.acceptance = jnp.concatenate((self.initial_acceptance, q_acceptance[1:, :]), axis=0)
+
+    def save_samples(self):
+        """Extracts and saves post-burn-in samples."""
+        if self.chains.shape[1] > self.n_burnin:
+            samples_raw = self.chains[:, self.n_burnin:, :]
+            self.samples = samples_raw.transpose((2, 1, 0)).reshape(-1, self.n_parameters)
+        else:
+            self.samples = None
+            
+    def save_orbits(self, q_orbit):
+        """Saves orbits."""
+        if self.chains.shape[1] > self.n_burnin:
+            orbits_raw = q_orbit[:, :, self.n_burnin:, :]
+            self.orbits = orbits_raw.transpose((2,3,1,0)).reshape(-1, self.steps, self.n_parameters)
+        else:
+            self.orbits = None
+
+    def plot_samples(self, labels: list = None, truths: list = None):
+        """Produces a corner plot of the samples."""
+        if self.samples is None:
+            print("No samples to plot. Run the sampler first.")
+            return None
+        if labels is None and self.dim_labels is not None:
             labels = self.dim_labels
         
+        samples_np = np.asarray(self.samples)
+        
         figure = corner.corner(
-            self.samples,
+            samples_np,
             labels=labels,
-                quantiles=[0.16, 0.5, 0.84],
-                show_titles=True,
-                title_kwargs={"fontsize": 12})
-        return figure
-
-    def plot_orbits(self, n_orbits: int=10, labels: list=None):
-        """Produces corner plot with first n_orbits orbits overplotted
-
-        Args:
-            n_orbits (int): number of orbits to be displayed on corner plot
-            labels (list): names of parameters to be added to plots
-        Returns:
-            matplotlib.figure.Figure: corner plot of samples with obrits overplotted
-        """        ''''''
-
-        figure,ax = plt.subplots(self.n_parameters, self.n_parameters, sharex= 'col', 
-                              figsize=(2.5*self.n_parameters,2.5*self.n_parameters))
-
-        if labels is None:
-            labels = self.dim_labels
-
-        for i in range(self.n_parameters):
-            for j in range(self.n_parameters):
-
-                if i == j:
-
-                    hist, xedges = np.histogram(self.samples[:,i],51)
-
-                    xcentres = (xedges[1:] + xedges[:-1])/2.0
-
-
-                    ax[j,i].hist(self.samples[:,i], 30, histtype ='step', color='k')
-                    ax[j,i].set_xticks(np.linspace(np.min(xcentres),np.max(xcentres),5))
-                    ax[j,i].xaxis.set_major_formatter(FormatStrFormatter('%.2f'))
-                    ax[j,i].set_yticklabels ([])
-
-                    low,med,hi = np.quantile(self.samples[:,i],(0.16,0.5,0.84))
-
-                    low = low - med
-                    hi = hi - med
-
-                    ax[j,i].set_title(labels[i] + '={:.2f}'.format(med) + '$_{{{0:.2f}}}^{{+{1:.2f}}}$'.format(low,hi))
-
-                    lowy,hiy = ax[j,i].get_ylim()
-
-                    ax[j,i].plot([med,med],[1e-24,1e24],'k--')
-                    ax[j,i].plot([med+low,med+low],[1e-24,1e24],'k:')
-                    ax[j,i].plot([med+hi,med+hi],[1e-24,1e24],'k:')
-
-                    lowx, hix = np.quantile(self.samples[:,i],(0.001,0.999))
-
-                    ax[j,i].set_xlim((lowx,hix))
-                    ax[j,i].set_ylim((lowy,hiy))
-
-                    if j == self.n_parameters-1:
-                        ax[j,i].set_xlabel(labels[i])
-
-                    if i == 0:
-                        ax[j,i].set_ylabel(labels[j])
-
-
-                elif i<j:
-
-                    axes = {i,j}
-
-                    other_axes = list(set(range(self.n_parameters)) - axes)
-                    other_axes.reverse()
-
-                    xcentres = np.linspace(np.min(self.samples[:,i]),np.max(self.samples[:,i]),51)
-                    ycentres = np.linspace(np.min(self.samples[:,j]),np.max(self.samples[:,j]),51)
-
-                    xx,yy = np.meshgrid(xcentres,ycentres)
-
-                    kern = gaussian_kde(np.vstack([self.samples[:,i],self.samples[:,j]]))
-
-                    hist = np.reshape(kern(np.vstack([xx.ravel(),yy.ravel()])).T, xx.shape)
-                    hist = hist/np.max(hist)
-
-                    medx = np.quantile(self.samples[:,i],0.5)
-                    medy = np.quantile(self.samples[:,j],0.5)
-
-                    lowx, hix = np.quantile(self.samples[:,i],(0.001,0.999))
-                    lowy, hiy = np.quantile(self.samples[:,j],(0.001,0.999))
-
-                    lvls = [0.118, 0.393, 0.675,0.864,1.0]
-
-                    ax[j,i].contourf(xcentres,ycentres,hist, levels = lvls, norm='linear', cmap = 'Greys', alpha=0.7)
-
-                    ax[j,i].plot(xcentres,medy*(xcentres*0.0 + 1.0),'k--', alpha = 0.5)
-                    ax[j,i].plot(medx*(xcentres*0.0 + 1.0),ycentres,'k--', alpha = 0.5)
-
-                    ax[j,i].plot(self.orbits[:n_orbits,:,i].T,self.orbits[:n_orbits,:,j].T,'b-', alpha = 0.7)
-                    ax[j,i].plot(self.samples[:n_orbits+1,i],self.samples[:n_orbits+1,j],'bo', alpha = 0.7)
-
-                    ax[j,i].set_xlim((lowx,hix))
-                    ax[j,i].set_ylim((lowy,hiy))
-                    ax[j,i].set_xticks(np.linspace(lowx,hix,5))
-                    ax[j,i].set_yticks(np.linspace(lowy,hiy,5))
-                    ax[j,i].yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
-
-
-                    if j == self.n_parameters-1:
-                        ax[j,i].set_xlabel(labels[i])
-
-                    if i == 0:
-                        ax[j,i].set_ylabel(labels[j])
-
-                    if i>0:
-                        ax[j,i].set_yticklabels ([])
-
-
-                else:
-                    ax[j,i].axis('off')
-
-        plt.tight_layout(pad=0.4, w_pad=0.1, h_pad=0.1)
+            truths=truths,
+            quantiles=[0.16, 0.5, 0.84],
+            show_titles=True,
+            title_kwargs={"fontsize": 12}
+        )
         return figure
     
-    def plot_chains(self,labels: list = None):
-
-        if labels is None:
+    def plot_chains(self, labels: list = None):
+        """Plots the walker chains over iterations."""
+        if self.chains is None:
+            print("No chains to plot.")
+            return
+        if labels is None and self.dim_labels is not None:
             labels = self.dim_labels
-
-        figure,ax = plt.subplots(self.n_parameters+1, sharex= 'col', 
-        figsize=(4.5,1.5*self.n_parameters))
-
+        
+        chains_np = np.asarray(self.chains)
+        samples_np = np.asarray(self.samples) if self.samples is not None else None
+        
+        figure, ax = plt.subplots(self.n_parameters + 1, sharex='col', figsize=(8, 1.5 * (self.n_parameters + 1)))
+        
         for i in range(self.n_parameters):
-            if(self.samples is not None):
-                p16,p50,p84 = np.percentile(self.samples[:,i],[16,50,84])
-                ax[i].plot([0,self.n],[p16,p16],'r-.')
-                ax[i].plot([0,self.n],[p50,p50],'r--')
-                ax[i].plot([0,self.n],[p84,p84],'r-.')
+            if samples_np is not None:
+                p16, p50, p84 = np.percentile(samples_np[:, i], [16, 50, 84])
+                ax[i].axhline(p16, color='r', linestyle='-.', lw=1)
+                ax[i].axhline(p50, color='r', linestyle='--', lw=1)
+                ax[i].axhline(p84, color='r', linestyle='-.', lw=1)
 
-            ax[i].plot(self.chains[i,:,:],'k',alpha=0.1)
+            ax[i].plot(chains_np[i, :, :], 'k', alpha=0.1)
             yl = ax[i].get_ylim()
-            ax[i].plot([self.n_burnin,self.n_burnin],[-1e6,1e6],'b--')
-            ax[i].set_ylabel(labels[i])
-            ax[i].set_xlim([-1,self.n+1])
-            ax[i].set_ylim([yl[0],yl[1]])
+            ax[i].axvline(self.n_burnin, color='b', linestyle='--')
+            ax[i].set_ylabel(labels[i] if labels else f'Param {i}')
+            ax[i].set_xlim([-1, self.n + 1])
+            ax[i].set_ylim(yl)
 
-        ax[self.n_parameters].plot(self.U(self.chains), 'k',alpha=0.1)
+        n_params, n_collect, n_walkers = chains_np.shape
+        chains_reshaped = chains_np.reshape((n_params, n_collect * n_walkers))
+        U_vals_flat = self.U(chains_reshaped)
+        U_vals = np.asarray(U_vals_flat).reshape((n_collect, n_walkers))
+
+        ax[self.n_parameters].plot(U_vals, 'k', alpha=0.1)
         ax[self.n_parameters].set_ylabel('U')
-        ax[self.n_parameters].set_xlim([-1,self.n+1])
-
-
+        ax[self.n_parameters].set_xlim([-1, self.n + 1])
         ax[self.n_parameters].set_xlabel('Iteration')
+        
         plt.tight_layout(pad=0.4, w_pad=0.1, h_pad=0.1)
         return figure
     
-    def dU_numerical(self,q):
+    def _plot_ellipse(self, ax, mean, cov, n_std=1.0, **kwargs):
+        """Helper function to plot a 2D covariance ellipse."""
+        # Get eigenvalues and eigenvectors
+        vals, vecs = np.linalg.eigh(cov)
+        # Get angle of rotation
+        x, y = vecs[:, 0]
+        angle = np.degrees(np.arctan2(y, x))
 
-        output = np.zeros(q.shape)
+        # Get ellipse width and height
+        # The chi2 distribution is used to find the scaling factor for the desired confidence level
+        # For 1-sigma in 2D, this is sqrt(2.30)
+        # For 2-sigma in 2D, this is sqrt(6.18)
+        s = np.sqrt(2.30) if n_std == 1.0 else np.sqrt(6.18) if n_std == 2.0 else n_std
+        width, height = 2 * s * np.sqrt(vals)
+        
+        # Create ellipse
+        ellipse = Ellipse(xy=mean, width=width, height=height, angle=angle, **kwargs)
+        ax.add_patch(ellipse)
 
-        U0 = self.U(q)
-        q0 = q*0.0
+    def plot_covariance_comparison(self, means, cov_dict, labels=None, truths=None, n_std=1.0):
+        """
+        Creates a corner plot comparing multiple covariance matrices as ellipses.
 
-        steps = q.shape[0]
+        Parameters:
+            means (np.ndarray): The mean vector for the parameters, shape (n_parameters,).
+            cov_dict (dict): A dictionary where keys are method names (str) and
+                             values are covariance matrices (np.ndarray).
+            labels (list, optional): Names of the parameters for plot axes.
+            truths (list, optional): True values of parameters to overplot.
+            n_std (float, optional): The number of standard deviations for the ellipse contour (1.0 or 2.0).
+        """
+        n_dim = len(means)
+        if n_dim < 2:
+            print("Covariance comparison plot requires at least 2 dimensions.")
+            return
 
-        for i in range(steps):
-            qi = q0*0.0
-            qi[i] = self.dU_step_size
-    
-            U1 = self.U(q+qi)
-            #U2 = self.U(q-qi)
+        if labels is None:
+            labels = [f'p{i}' for i in range(n_dim)]
 
-            output[i] = (U1-U0)/(self.dU_step_size)
+        fig, axes = plt.subplots(n_dim - 1, n_dim - 1, figsize=(3 * (n_dim - 1), 3 * (n_dim - 1)))
+        # Ensure axes is a 2D array even for n_dim=2
+        if n_dim == 2:
+            axes = np.array([[axes]])
 
+        colors = plt.cm.viridis(np.linspace(0, 1, len(cov_dict)))
 
-        return output
-    
+        for i in range(1, n_dim):
+            for j in range(i):
+                # Map from parameter indices (i, j) to subplot grid (row, col)
+                row, col = i - 1, j
+                ax = axes[row, col]
+
+                # --- Off-diagonal plots (2D ellipses) ---
+                for k, (name, cov) in enumerate(cov_dict.items()):
+                    # Extract the 2x2 sub-matrix for parameters j and i
+                    cov_2d = cov[np.ix_([j, i], [j, i])]
+                    mean_2d = means[[j, i]]
+                    self._plot_ellipse(ax, mean_2d, cov_2d, n_std=n_std, 
+                                       facecolor='none', edgecolor=colors[k], lw=1.5, label=name)
+                if truths is not None:
+                    ax.plot(truths[j], truths[i], 'rs', markersize=5)
+                
+                # --- Set plot limits based on the largest covariance ---
+                all_covs = [c[np.ix_([j, i], [j, i])] for c in cov_dict.values()]
+                max_std = np.max([np.sqrt(np.diag(c)) for c in all_covs], axis=0) * (n_std * 2.5) # Increased buffer
+                ax.set_xlim(means[j] - max_std[0], means[j] + max_std[0])
+                ax.set_ylim(means[i] - max_std[1], means[i] + max_std[1])
+
+                # --- Labels and Ticks ---
+                if col == 0:
+                    ax.set_ylabel(labels[i])
+                if row == n_dim - 2:
+                    ax.set_xlabel(labels[j])
+                
+                if row < n_dim - 2:
+                    ax.set_xticklabels([])
+                if col > 0:
+                    ax.set_yticklabels([])
+        
+        # Turn off unused upper-triangle axes
+        for i in range(n_dim - 1):
+            for j in range(n_dim - 1):
+                if j > i:
+                    axes[i, j].axis('off')
+
+        # Create a single legend for the whole figure
+        handles = [plt.Line2D([0], [0], color=c, lw=2) for c in colors]
+        fig.legend(handles, cov_dict.keys(), loc='upper right')
+        
+        fig.tight_layout(pad=0.5)
+        plt.show()
+
     def reset(self):
-        """
-        Reset all simulation attributes.
-
-        This function clears the stored state, chains, samples, orbits, and 
-        acceptance data, effectively preparing the object for a fresh simulation 
-        run.
-
-        Attributes Reset
-        -----------------
-        self.state : None
-            The current state of the walkers is cleared.
-        self.chains : None
-            The Markov chains are cleared.
-        self.samples : None
-            The collected samples are cleared.
-        self.orbits : None
-            The recorded orbital paths are cleared.
-        self.acceptance : None
-            The acceptance rates are cleared.
-
-        Example
-        -------
-        obj.reset()
-        """
+        """Resets all simulation attributes."""
         self.state = None
         self.chains = None
         self.samples = None
         self.orbits = None
         self.acceptance = None
+        self.qi = None
 
-    def save(self, file_name: str=None,add_time = True):
+    def save(self, file_name: str):
         """
-        Save the current state of the object to a file.
-
-        This function serializes the current state of the object and saves it 
-        to a file using Python's `pickle` module. The file name can be specified 
-        manually or generated automatically, with an option to include a timestamp 
-        for uniqueness.
-
-        Parameters
-        ----------
-        file_name : str, optional
-            The base name of the file to save the object to. If not provided, the 
-            default name `'HMC'` is used. If `self.file_name` is set, it will override 
-            this default.
-        add_time : bool, optional
-            If `True`, appends the current date and time to the file name to ensure 
-            uniqueness. Default is `True`.
-
-        Notes
-        -----
-        - If the file name ends with the extension `.hmc`, the extension is removed 
-          before generating the final file name.
-        - The timestamp format is `YYYY-MM-DD-HH-MM-SS`.
-        - The file is saved with the `.hmc` extension by default if not already present.
-        - This method uses `pickle` for serialization, so any object attributes must 
-          be serializable.
-
-        Example
-        -------
-        obj.save("my_simulation", add_time=True)
+        Saves the serializable state of the sampler to a file using pickle.
+        This method automatically saves any attribute that is not a function.
         """
-        if file_name is None and self.file_name is None:
-            file_name = 'HMC'
-
-        if file_name is None and self.file_name is not None:
-            file_name = self.file_name
-
-        if file_name.endswith('.hmc'):
-            file_name = file_name[:-4]
-
-        if add_time:
-            now = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-            file_name += '_'+now
-
-        if not file_name.endswith('.hmc'):
-            file_name += '.hmc' 
+        state_dict = {}
+        for key, value in self.__dict__.items():
+            # Exclude callables (functions, methods) which are not serializable
+            if not callable(value):
+                state_dict[key] = value
 
         with open(file_name, "wb") as file:
-            pickle.dump(self, file)
-    
+            pickle.dump(state_dict, file)
+        print(f"Sampler state saved to {file_name}")
+
     def load(self, file_name: str):
         """
-        Load a previously saved object state from a file and update the current instance.
-
-        This function deserializes a saved object using Python's `pickle` module 
-        and transfers its attributes to the current instance. It ensures that only 
-        non-private, non-callable attributes are copied, preserving methods and private 
-        attributes of the existing instance.
-
-        Parameters
-        ----------
-        file_name : str
-            The name of the file from which the object state is to be loaded. 
-            The file must have been saved using a compatible method (e.g., `save`).
-
-        Notes
-        -----
-        - Private attributes (those starting with `"__"`) and methods are excluded 
-          when transferring attributes from the loaded object.
-        - The loaded attributes overwrite any existing attributes in the current instance 
-          with the same name.
-        - This method relies on `pickle`, so the file must contain a serialized object 
-          compatible with the current class.
-
-        Example
-        -------
-        obj.load("saved_simulation.hmc")
+        Loads the state of a sampler from a file.
+        The sampler object must be instantiated with the correct U function
+        (or model/data for subclasses) before calling this method.
         """
         with open(file_name, "rb") as file:
-            loaded = pickle.load(file)
-
-        for attr in dir(loaded):
-            # Filter out private attributes and methods
-            if not attr.startswith("__") and not callable(getattr(loaded, attr)):
-                value = getattr(loaded, attr)  # Get the attribute value
-                setattr(self, attr, value) 
-
-
+            state_dict = pickle.load(file)
         
+        for key, value in state_dict.items():
+            setattr(self, key, value)
+        
+        print(f"Sampler state loaded from {file_name}")
+
+    def calculate_medians(self):
+        if self.samples is not None:
+            self.q_medians = np.median(self.samples, axis=0)
+
+    def calculate_covariance(self):
+        if self.samples is not None:
+            self.q_covariance = np.cov(self.samples.T)
+
+
+# --- (NEW) Specialized Subclass for Bayesian Inference ---
+class BayesianHMCSampler(HMCSampler):
+    """
+    A specialized HMCSampler for Bayesian inference.
+
+    This class constructs the potential energy function from a log-likelihood and
+    a log-prior, simplifying the user workflow for Bayesian problems.
+    """
+    def __init__(self, log_likelihood, log_prior=None, prior_mean=None, prior_sd=None, dU=None):
+        """
+        Initializes the Bayesian sampler.
+
+        Parameters:
+            log_likelihood (callable): The log-likelihood function, `log(P(data|theta))`.
+            log_prior (callable, optional): The log-prior function, `log(P(theta))`.
+                                            It must have the signature `log_prior(theta, mean, sd)`.
+                                            Takes precedence over the default Gaussian prior.
+            prior_mean (jnp.ndarray, optional): Mean for a Gaussian prior.
+            prior_sd (jnp.ndarray, optional): Standard deviation for a Gaussian prior.
+            dU (callable, optional): A manual gradient function for the potential energy.
+        """
+        # --- Define default prior functions with the new, flexible signature ---
+        def gaussian_log_prior(theta, mean, sd):
+            if mean is None or sd is None:
+                return 0.0 # Behave like a uniform prior if params are missing
+            return -0.5 * jnp.sum(((theta - mean) / sd)**2)
+
+        def uniform_log_prior(theta, mean, sd):
+            return 0.0
+
+        # --- Select the prior function to use ---
+        if log_prior is not None:
+            # User provided a custom prior function
+            selected_log_prior = log_prior
+        elif prior_mean is not None and prior_sd is not None:
+            # User provided parameters for the default Gaussian prior
+            selected_log_prior = gaussian_log_prior
+        else:
+            # Default to a uniform prior
+            selected_log_prior = uniform_log_prior
+
+        # --- Create the final potential energy function ---
+        # It combines the likelihood and the selected prior.
+        def potential_energy(theta):
+            # The selected log_prior function is called with the stored mean and sd
+            log_prior_val = selected_log_prior(theta, prior_mean, prior_sd)
+            log_likelihood_val = log_likelihood(theta)
+            return -(log_likelihood_val + log_prior_val)
+        
+        super().__init__(U=potential_energy, dU=dU)
+
+    # Alias for run_hmc
+    sample_posterior = HMCSampler.run_hmc
+
+
+# --- Specialized Subclass for Model Fitting, inheriting from Bayesian Sampler ---
+class ModelFitterHMC(BayesianHMCSampler):
+    """
+    A specialized HMCSampler for fitting a model to data, assuming a Gaussian likelihood.
+    """
+    def __init__(self, model, x_data, y_data, y_err=1.0, 
+                 log_prior=None, prior_mean=None, prior_sd=None, dU=None):
+        """
+        Initializes the model-fitting sampler.
+
+        Parameters:
+            model (callable): The model function, `model(theta, x)`.
+            x_data, y_data, y_err: The data and uncertainties.
+            log_prior, prior_mean, prior_sd: Options for the prior, passed to BayesianHMCSampler.
+            dU (callable, optional): A manual gradient function.
+        """
+        self.model = model
+        self.x_data = x_data
+        self.y_data = y_data
+        self.y_err = y_err
+
+        # Define the log-likelihood based on a Gaussian assumption (chi-squared)
+        def log_likelihood(theta):
+            model_y = self.model(theta, self.x_data)
+            chi_squared = jnp.sum(((self.y_data - model_y) / self.y_err)**2)
+            return -chi_squared / 2.0
+        
+        # Call the parent BayesianHMCSampler's __init__
+        super().__init__(log_likelihood=log_likelihood, log_prior=log_prior, 
+                         prior_mean=prior_mean, prior_sd=prior_sd, dU=dU)
+
+    # Alias for run_hmc
+    fit_model = HMCSampler.run_hmc
+
+
