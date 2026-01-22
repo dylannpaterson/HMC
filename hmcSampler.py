@@ -2,7 +2,7 @@ import os
 # This flag must be set before jax is imported.
 # Set this to the number of CPU cores you want JAX to see.
 # If you have a GPU, JAX will use it by default and this flag will be ignored.
-os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=8'
+#os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=8'
 
 import jax
 import jax.numpy as jnp
@@ -125,7 +125,7 @@ class HMCSampler:
         q = qi
 
         # Initialize orbit storage
-        q_orbit = jnp.zeros((steps, n_parameters, n_walkers_device))
+        q_orbit = jnp.zeros((steps + 1, n_parameters, n_walkers_device))
         q_orbit = q_orbit.at[0].set(q)
         
         # Main loop using JAX's optimized looping construct
@@ -142,8 +142,9 @@ class HMCSampler:
         # Final full step for position and half-step for momentum
         q = q + epsilon * p / self.m
         p = p - (epsilon / 2.0) * self.dU(q)
+
+        q_orbit = q_orbit.at[steps].set(q)
         
-        # The final position is q, not q_orbit[-1], to avoid an extra array lookup
         return q, -p, q_orbit
 
 
@@ -177,8 +178,7 @@ class HMCSampler:
             qf_prop, pf_prop, orbit = self._leapfrog_with_orbit(q, p, lf_length, steps)
         else:
             qf_prop, pf_prop = self._leapfrog(q, p, lf_length, steps)
-            # Create a dummy orbit if not storing to maintain function signature
-            orbit = jnp.zeros((steps, self.n_parameters, n_walkers_device))
+            orbit = jnp.zeros((steps + 1, self.n_parameters, n_walkers_device))
 
 
         # 3. Determine initial and final energies
@@ -232,7 +232,7 @@ class HMCSampler:
             q_sample = q_sample.at[:, 0, :].set(self.state)
 
         if self.store_orbits:
-            q_orbit = jnp.zeros((self.n_parameters, self.steps, self.n_collect, self.n_walkers))
+            q_orbit = jnp.zeros((self.n_parameters, self.steps+1, self.n_collect, self.n_walkers))
         
         q_acceptance = jnp.zeros((self.n_collect, self.n_walkers))
         
@@ -260,7 +260,7 @@ class HMCSampler:
                 q_acceptance = q_acceptance.at[ii, :].set(accepted_flat)
                 
                 if self.store_orbits:
-                    orbit_flat = orbit_sharded.transpose(2, 1, 0, 3).reshape(self.n_parameters, self.steps, self.n_walkers)
+                    orbit_flat = orbit_sharded.transpose(2, 1, 0, 3).reshape(self.n_parameters, self.steps+1, self.n_walkers)
                     q_orbit = q_orbit.at[:, :, ii - 1, :].set(orbit_flat)
 
                 if self.save_every is not None and ii > 1 and ii % self.save_every == 0:
@@ -454,7 +454,7 @@ class HMCSampler:
         """Saves orbits."""
         if self.chains.shape[1] > self.n_burnin:
             orbits_raw = q_orbit[:, :, self.n_burnin:, :]
-            self.orbits = orbits_raw.transpose((2,3,1,0)).reshape(-1, self.steps, self.n_parameters)
+            self.orbits = orbits_raw.transpose((2,3,1,0)).reshape(-1, self.steps+1, self.n_parameters)
         else:
             self.orbits = None
 
