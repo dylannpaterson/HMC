@@ -74,7 +74,7 @@ class HMCSampler:
         dU_single = dU
 
         if dU_single is None:
-            print("`dU` not supplied. Using `jax.grad(U)` for automatic differentiation.")
+            #print("`dU` not supplied. Using `jax.grad(U)` for automatic differentiation.")
             dU_single = jax.grad(U_single)
         else:
             print("Manual `dU` supplied by the user.")
@@ -314,12 +314,15 @@ class HMCSampler:
         tau = 1 + 2 * np.sum(acf[1:M])
         return tau
 
-    def tune_leapfrog(self, qi_center, lf_lengths, steps_list, n_tune_samples=1000, n_tune_burnin=500):
+    def tune_leapfrog(self, qi_center, lf_lengths, steps_list, n_tune_samples=2000, n_tune_burnin=1000):
         """
-        Performs a grid search to find optimal leapfrog parameters.
+        Performs a grid search to find optimal leapfrog parameters using detailed diagnostics.
         
+        This method evaluates each parameter combination based on acceptance rate, convergence (R-hat),
+        and the effective sample size (ESS) generated per second, aiming to find the most
+        efficient set of parameters.
+
         Parameters:
-            key (jax.random.PRNGKey): JAX random key for the tuning run.
             qi_center (jnp.ndarray): The central point for the initial walker positions.
             lf_lengths (list): A list of leapfrog path lengths to test.
             steps_list (list): A list of leapfrog steps to test.
@@ -327,7 +330,7 @@ class HMCSampler:
             n_tune_burnin (int): Number of burn-in samples to discard for each tuning run.
         
         Returns:
-            list: A list of dictionaries, each containing the results for one parameter combination.
+            list: A list of dictionaries, each containing the detailed results for one parameter combination.
         """
         print("\n--- Commencing Leapfrog Parameter Tuning ---")
         results = []
@@ -343,7 +346,6 @@ class HMCSampler:
                 start_time = time.time()
 
                 # --- Create a pmapped function specifically for this tuning run ---
-                # Tuning runs never need to store orbits, so we set store_orbits=False
                 pmapped_step = jax.pmap(
                     functools.partial(self._step, lf_length=lf, steps=steps, store_orbits=False)
                 )
@@ -366,7 +368,6 @@ class HMCSampler:
                     q_current_flat = local_chains[:, ii - 1, :]
                     q_current_sharded = q_current_flat.reshape(self.n_parameters, num_devices, walkers_per_device).transpose(1, 0, 2)
                     
-                    # Pass parameters explicitly to the pmapped function
                     q_next_sharded, _, accepted_sharded, device_keys = pmapped_step(
                         q=q_current_sharded, 
                         key=device_keys
@@ -380,49 +381,66 @@ class HMCSampler:
                 
                 runtime = time.time() - start_time
 
-                # --- Analyze results ---
-                chains_after_burn = local_chains[:, n_tune_burnin:, :]
-                acceptance_after_burn = local_acceptance[n_tune_burnin:, :]
+                # --- Analyze results using new diagnostics ---
+                samples_raw = np.asarray(local_chains[:, n_tune_burnin:, :])
+                tuning_samples = samples_raw.transpose((2, 1, 0)).reshape(-1, self.n_parameters)
+                n_samples_total = len(tuning_samples)
+
+                mean_acceptance = np.mean(local_acceptance[n_tune_burnin:])
                 
-                samples_for_iat = chains_after_burn.transpose((2, 1, 0)).reshape(-1, self.n_parameters)
+                # R-hat
+                r_hats = self._calculate_r_hat(local_chains, n_tune_burnin)
+                max_r_hat = np.nanmax(r_hats) if r_hats is not None else np.nan
                 
-                mean_acceptance = jnp.mean(acceptance_after_burn)
-                iat_per_param = [self._integrated_autocorrelation_time(samples_for_iat[:, i]) for i in range(self.n_parameters)]
-                mean_iat = np.mean(iat_per_param)
+                # IAT and ESS
+                iats = [self._integrated_autocorrelation_time(tuning_samples[:, i]) for i in range(self.n_parameters)]
+                ess = [n_samples_total / iat if iat > 0 else 0 for iat in iats]
+                min_ess = np.min(ess)
+                
+                # Efficiency
+                ess_per_sec = min_ess / runtime if runtime > 0 else 0
                 
                 results.append({
                     'lf_length': lf,
                     'steps': steps,
                     'epsilon': epsilon,
                     'acceptance_rate': float(mean_acceptance),
-                    'mean_iat': float(mean_iat),
+                    'max_r_hat': float(max_r_hat),
+                    'min_ess': float(min_ess),
+                    'ess_per_sec': float(ess_per_sec),
                     'runtime': runtime
                 })
         
         print("\n--- Leapfrog Tuning Results ---")
-        print("-" * 80)
-        print(f"{'lf_length':<12} | {'steps':<8} | {'epsilon':<10} | {'acceptance':<12} | {'mean_iat':<12} | {'runtime (s)':<12}")
-        print("-" * 80)
-        for res in results:
-            print(f"{res['lf_length']:<12.3f} | {res['steps']:<8} | {res['epsilon']:<10.4f} | {res['acceptance_rate']:<12.3f} | {res['mean_iat']:<12.2f} | {res['runtime']:<12.2f}")
-        print("-" * 80)
+        print("-" * 100)
+        print(f"{ 'lf_length':<12} | { 'steps':<8} | { 'epsilon':<10} | { 'acceptance':<12} | { 'max_r_hat':<10} | { 'min_ess':<10} | { 'ESS/sec':<12} | { 'runtime (s)':<12}")
+        print("-" * 100)
+        for res in sorted(results, key=lambda x: x['ess_per_sec'], reverse=True):
+            print(f"{res['lf_length']:<12.3f} | {res['steps']:<8} | {res['epsilon']:<10.4f} | {res['acceptance_rate']:<12.3f} | {res['max_r_hat']:<10.3f} | {res['min_ess']:<10.1f} | {res['ess_per_sec']:<12.2f} | {res['runtime']:<12.2f}")
+        print("-" * 100)
 
-        # Find the best parameters based on a simple heuristic:
-        # Choose the run with an acceptance rate between 0.6 and 0.8 that has the lowest IAT.
-        best_params = None
-        min_iat = float('inf')
+        # --- New Heuristic for Best Parameters ---
+        # Filter for reasonable acceptance and convergence, then find max ESS/sec.
+        candidates = []
         for res in results:
-            if 0.6 < res['acceptance_rate'] < 0.95:
-                if res['mean_iat'] < min_iat:
-                    min_iat = res['mean_iat']
-                    best_params = res
+            # Acceptance rate filter (e.g., 0.5 to 0.95)
+            if not (0.5 < res['acceptance_rate'] < 0.95):
+                continue
+            # R-hat filter (e.g., < 1.2 for a short run)
+            if res['max_r_hat'] > 1.2:
+                continue
+            candidates.append(res)
 
-        if best_params:
+        if candidates:
+            # Sort candidates by efficiency (ESS/sec)
+            best_params = max(candidates, key=lambda x: x['ess_per_sec'])
             print(f"\nOptimal parameters found: lf_length={best_params['lf_length']}, steps={best_params['steps']}")
+            print(f"  (Based on maximizing ESS/sec while maintaining acceptance in (0.5, 0.95) and R-hat < 1.2)")
             self.lf_length = best_params['lf_length']
             self.steps = best_params['steps']
         else:
-            print("\nNo parameters found in the ideal acceptance range. Using defaults.")
+            print("\nNo parameters found in the ideal acceptance/convergence range. Using defaults.")
+            print("  Consider expanding the tuning grid or increasing `n_tune_samples`.")
         
         return results
 
@@ -610,16 +628,16 @@ class HMCSampler:
         fig.tight_layout(pad=0.5)
         plt.show()
 
-    def _calculate_r_hat(self):
+    def _calculate_r_hat(self, chains, burn_in):
         """
-        Calculates the Gelman-Rubin statistic (R-hat) to assess convergence.
+        Calculates the Gelman-Rubin statistic (R-hat) on a given set of chains.
         This implementation is based on the method described in the `arviz` library.
         """
-        if self.chains is None or self.chains.shape[1] <= self.n_burnin:
+        if chains is None or chains.shape[1] <= burn_in:
             return None
 
         # Use post-burn-in chains, ensuring it's a numpy array
-        chains = np.asarray(self.chains[:, self.n_burnin:, :])
+        chains = np.asarray(chains[:, burn_in:, :])
         n_params, n_samples, n_walkers = chains.shape
 
         if n_walkers < 2:
@@ -696,17 +714,17 @@ class HMCSampler:
         std_devs = np.std(self.samples, axis=0)
         
         # Calculate R-hat
-        r_hats = self._calculate_r_hat()
+        r_hats = self._calculate_r_hat(self.chains, self.n_burnin)
         
         # Calculate IAT and ESS
         iats = [self._integrated_autocorrelation_time(self.samples[:, i]) for i in range(n_params)]
         ess = [n_samples_total / iat if iat > 0 else 0 for iat in iats]
 
         print("\n--- Parameter Summary & Diagnostics ---")
-        header = f"{'Parameter':<15} | {'Median':>12} | {'Std Dev':>12}"
+        header = f"{ 'Parameter':<15} | { 'Median':>12} | { 'Std Dev':>12}"
         if truths is not None:
-            header += f" | {'Truth':>12} | {'Pull':>8}"
-        header += f" | {'R-hat':>8} | {'IAT':>8} | {'ESS':>9}"
+            header += f" | { 'Truth':>12} | { 'Pull':>8}"
+        header += f" | { 'R-hat':>8} | { 'IAT':>8} | { 'ESS':>9}"
         print(header)
         print("-" * len(header))
 
@@ -716,7 +734,7 @@ class HMCSampler:
                 pull = (medians[i] - truths[i]) / std_devs[i] if std_devs[i] > 0 else np.nan
                 line += f" | {truths[i]:>12.4f} | {pull:>8.2f}"
             elif truths is not None:
-                line += f" | {'N/A':>12} | {'N/A':>8}"
+                line += f" | { 'N/A':>12} | { 'N/A':>8}"
 
             r_hat_str = f"{r_hats[i]:.3f}" if r_hats is not None and not np.isnan(r_hats[i]) else "N/A"
             line += f" | {r_hat_str:>8} | {iats[i]:>8.2f} | {int(ess[i]):>9}"
@@ -866,5 +884,3 @@ class ModelFitterHMC(BayesianHMCSampler):
 
     # Alias for run_hmc
     fit_model = HMCSampler.run_hmc
-
-
