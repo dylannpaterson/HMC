@@ -610,6 +610,127 @@ class HMCSampler:
         fig.tight_layout(pad=0.5)
         plt.show()
 
+    def _calculate_r_hat(self):
+        """
+        Calculates the Gelman-Rubin statistic (R-hat) to assess convergence.
+        This implementation is based on the method described in the `arviz` library.
+        """
+        if self.chains is None or self.chains.shape[1] <= self.n_burnin:
+            return None
+
+        # Use post-burn-in chains, ensuring it's a numpy array
+        chains = np.asarray(self.chains[:, self.n_burnin:, :])
+        n_params, n_samples, n_walkers = chains.shape
+
+        if n_walkers < 2:
+            # R-hat requires at least 2 chains
+            return np.full(n_params, np.nan)
+
+        r_hats = []
+        for i in range(n_params):
+            param_chains = chains[i, :, :]  # Shape: (n_samples, n_walkers)
+
+            # 1. Calculate within-chain variance (W)
+            # Variance of each chain, then average over chains
+            s_j_sq = np.var(param_chains, axis=0, ddof=1)
+            W = np.mean(s_j_sq)
+
+            # 2. Calculate between-chain variance (B)
+            # Mean of each chain
+            psi_bar_j = np.mean(param_chains, axis=0)
+            # Mean of all samples
+            psi_bar = np.mean(psi_bar_j)
+            B = (n_samples / (n_walkers - 1)) * np.sum((psi_bar_j - psi_bar)**2)
+
+            # 3. Estimate marginal posterior variance
+            var_hat = ((n_samples - 1) / n_samples) * W + (1 / n_samples) * B
+            
+            # Handle case where W is zero (e.g., if a chain is constant)
+            if W > 0:
+                r_hat = np.sqrt(var_hat / W)
+                r_hats.append(r_hat)
+            else:
+                r_hats.append(np.inf) # Or np.nan, inf is more indicative of a problem
+            
+        return np.array(r_hats)
+
+    def print_results(self, truths: list = None):
+        """
+        Prints a summary of the HMC run results and convergence diagnostics.
+
+        Parameters:
+            truths (list, optional): A list of true parameter values to compare against.
+                                     If provided, the summary will include a 'pull' value
+                                     ( (median - truth) / std_dev ).
+        """
+        if self.samples is None or self.chains is None:
+            print("No samples available. Run the sampler first.")
+            return
+
+        # --- Basic Run Info ---
+        n_params = self.n_parameters
+        n_samples_total = len(self.samples)
+        n_walkers = self.n_walkers
+        # Handle case where n_walkers might be 0 to avoid division error
+        n_steps_per_walker = n_samples_total // n_walkers if n_walkers > 0 else 0
+
+        print("\n--- HMC Run Summary ---")
+        print(f"Number of walkers: {n_walkers}")
+        print(f"Burn-in steps discarded per walker: {self.n_burnin}")
+        print(f"Samples per walker (post-burn-in): {n_steps_per_walker}")
+        print(f"Total samples (post-burn-in): {n_samples_total}")
+
+        # --- Acceptance Rate ---
+        if self.acceptance is not None and self.acceptance.shape[0] > self.n_burnin:
+            mean_acceptance = np.mean(self.acceptance[self.n_burnin:])
+            print(f"\nMean acceptance rate: {mean_acceptance:.3f}")
+            if not (0.6 < mean_acceptance < 0.95):
+                self.warn += "\nAcceptance rate is outside the typical optimal range of 0.6-0.95."
+        else:
+            print("\nAcceptance rate: Not available.")
+
+        # --- Parameter Statistics and Diagnostics ---
+        labels = self.dim_labels if self.dim_labels is not None else [f'Param {i}' for i in range(n_params)]
+        
+        medians = np.median(self.samples, axis=0)
+        std_devs = np.std(self.samples, axis=0)
+        
+        # Calculate R-hat
+        r_hats = self._calculate_r_hat()
+        
+        # Calculate IAT and ESS
+        iats = [self._integrated_autocorrelation_time(self.samples[:, i]) for i in range(n_params)]
+        ess = [n_samples_total / iat if iat > 0 else 0 for iat in iats]
+
+        print("\n--- Parameter Summary & Diagnostics ---")
+        header = f"{'Parameter':<15} | {'Median':>12} | {'Std Dev':>12}"
+        if truths is not None:
+            header += f" | {'Truth':>12} | {'Pull':>8}"
+        header += f" | {'R-hat':>8} | {'IAT':>8} | {'ESS':>9}"
+        print(header)
+        print("-" * len(header))
+
+        for i in range(n_params):
+            line = f"{labels[i]:<15} | {medians[i]:>12.4f} | {std_devs[i]:>12.4f}"
+            if truths is not None and i < len(truths):
+                pull = (medians[i] - truths[i]) / std_devs[i] if std_devs[i] > 0 else np.nan
+                line += f" | {truths[i]:>12.4f} | {pull:>8.2f}"
+            elif truths is not None:
+                line += f" | {'N/A':>12} | {'N/A':>8}"
+
+            r_hat_str = f"{r_hats[i]:.3f}" if r_hats is not None and not np.isnan(r_hats[i]) else "N/A"
+            line += f" | {r_hat_str:>8} | {iats[i]:>8.2f} | {int(ess[i]):>9}"
+            print(line)
+        
+        print("-" * len(header))
+        print("\nDiagnostic Guide:")
+        print("  - R-hat (Gelman-Rubin): Values near 1.0 (e.g., < 1.01) suggest chains have converged.")
+        print("  - IAT (Autocorrelation Time): Estimates number of steps for a new independent sample. Lower is better.")
+        print("  - ESS (Effective Sample Size): Estimates number of independent samples. Higher is better.")
+
+        if self.warn:
+            print("\n--- Warnings ---" + self.warn)
+
     def reset(self):
         """Resets all simulation attributes."""
         self.state = None
